@@ -1,0 +1,39 @@
+[workspace]
+# Elenco di tutti i crate che compongono il progetto
+members = [
+    "crates/ferrite-protocol",
+    "crates/ferrite-broker-core",
+    "crates/ferrite-client",
+    "crates/ferrite-broker",
+    "crates/ferrite-cli",
+]
+resolver = "2"
+
+# Metadati ereditati da tutti i crate (così non li ripetiamo 5 volte)
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Domenico Cangelli"]
+
+# Qui dichiariamo le librerie esterne e le loro versioni esatte
+[workspace.dependencies]
+# Tokio: l'event loop asincrono multi-thread (il cuore della velocità)
+tokio = { version = "1.38", features = ["full"] }
+
+# tokio-util: strumenti per gestire streaming di byte e codec di rete
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# bytes: manipolazione ultra-veloce di array di byte senza copiare memoria (zero-copy)
+bytes = "1.6"
+
+# thiserror: macro per creare tipi di errore idiomatici ed espliciti
+thiserror = "1.0"
+
+# tracing: sistema moderno di logging asincrono strutturato
+tracing = "0.1"
+
+# Collegamenti interni tra i nostri stessi crate
+ferrite-protocol = { path = "crates/ferrite-protocol" }
+ferrite-broker-core = { path = "crates/ferrite-broker-core" }
+ferrite-client = { path = "crates/ferrite-client" }
