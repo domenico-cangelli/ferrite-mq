@@ -1,6 +1,12 @@
 [package]
 name = "ferrite-protocol"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
 
 [dependencies]
+bytes.workspace = true
+tokio-util.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

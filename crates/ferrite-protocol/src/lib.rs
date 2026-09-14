@@ -1,14 +1,7 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub mod error;
+pub mod packet;
+pub mod varint;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+// Ri-esportiamo i tipi principali per renderli accessibili comodamente dall'esterno
+pub use error::ProtocolError;
+pub use packet::{Packet, PacketType, QoS};
