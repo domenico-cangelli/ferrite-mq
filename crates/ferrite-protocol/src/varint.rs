@@ -105,9 +105,11 @@ mod tests {
     fn test_varint_overflow() {
         // 5 consecutive bytes with continuation bits -> exceeds 4 bytes limit
         let mut buf = Bytes::from_static(&[0x80, 0x80, 0x80, 0x80, 0x01]);
-        assert_eq!(
-            decode_varint(&mut buf).unwrap_err(),
-            ProtocolError::MalformedRemainingLength
-        );
+
+        // Sostituisci assert_eq! con assert!(matches!(...))
+        assert!(matches!(
+        decode_varint(&mut buf),
+        Err(ProtocolError::MalformedRemainingLength)
+    ));
     }
 }

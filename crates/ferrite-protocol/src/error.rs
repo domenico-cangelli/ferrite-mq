@@ -1,7 +1,11 @@
 use thiserror::Error;
+use std::io;
 
-#[derive(Debug,PartialEq, Eq, Error)]
+#[derive(Debug, Error)]
 pub enum ProtocolError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+
     #[error("Malformed remaining length: exceeds 4-byte MQTT specification limit")]
     MalformedRemainingLength,
 
