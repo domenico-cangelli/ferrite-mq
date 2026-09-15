@@ -27,6 +27,54 @@ impl TryFrom<u8> for QoS {
     }
 }
 
+/// MQTT Protocol Version
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ProtocolVersion {
+    Mqtt311 = 4,
+    Mqtt50 = 5,
+}
+
+impl TryFrom<u8> for ProtocolVersion {
+    type Error = ProtocolError;
+
+    fn try_from(val: u8) -> Result<Self, Self::Error> {
+        match val {
+            4 => Ok(ProtocolVersion::Mqtt311),
+            5 => Ok(ProtocolVersion::Mqtt50),
+            _ => Err(ProtocolError::InvalidPacketType(val)),
+        }
+    }
+}
+
+/// Return code for CONNACK (MQTT 3.1.1)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConnectReturnCode {
+    Accepted = 0,
+    RefusedUnacceptableProtocolVersion = 1,
+    RefusedIdentifierRejected = 2,
+    RefusedServerUnavailable = 3,
+    RefusedBadUsernameOrPassword = 4,
+    RefusedNotAuthorized = 5,
+}
+
+impl TryFrom<u8> for ConnectReturnCode {
+    type Error = ProtocolError;
+
+    fn try_from(val: u8) -> Result<Self, Self::Error> {
+        match val {
+            0 => Ok(ConnectReturnCode::Accepted),
+            1 => Ok(ConnectReturnCode::RefusedUnacceptableProtocolVersion),
+            2 => Ok(ConnectReturnCode::RefusedIdentifierRejected),
+            3 => Ok(ConnectReturnCode::RefusedServerUnavailable),
+            4 => Ok(ConnectReturnCode::RefusedBadUsernameOrPassword),
+            5 => Ok(ConnectReturnCode::RefusedNotAuthorized),
+            other => Err(ProtocolError::InvalidPacketType(other)),
+        }
+    }
+}
+
 /// MQTT Control Packet types (encoded in the upper 4 bits of the first fixed header byte).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -77,6 +125,18 @@ impl TryFrom<u8> for PacketType {
 /// High-level strongly-typed MQTT packets.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
+    Connect {
+        protocol_version: ProtocolVersion,
+        clean_session: bool,
+        keep_alive: u16,
+        client_id: String,
+        username: Option<String>,
+        password: Option<Bytes>,
+    },
+    ConnAck {
+        session_present: bool,
+        return_code: ConnectReturnCode,
+    },
     PingReq,
     PingResp,
     Disconnect,
