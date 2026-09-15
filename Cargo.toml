@@ -33,6 +33,10 @@ thiserror = "1.0"
 # tracing: sistema moderno di logging asincrono strutturato
 tracing = "0.1"
 
+# Aggiungi queste due righe mancanti:
+futures = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 # Collegamenti interni tra i nostri stessi crate
 ferrite-protocol = { path = "crates/ferrite-protocol" }
 ferrite-broker-core = { path = "crates/ferrite-broker-core" }

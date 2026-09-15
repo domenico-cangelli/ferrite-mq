@@ -5,5 +5,5 @@ pub mod codec;
 
 // Ri-esportiamo i tipi principali per renderli accessibili comodamente dall'esterno
 pub use error::ProtocolError;
-pub use packet::{Packet, PacketType, QoS};
+pub use packet::{ConnectReturnCode, Packet, PacketType, ProtocolVersion, QoS};
 pub use codec::MqttCodec;
