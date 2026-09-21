@@ -4,6 +4,7 @@ use crate::varint::{decode_varint, encode_varint};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::str;
 use tokio_util::codec::{Decoder, Encoder};
+use crate::{SubAckReturnCode, SubscribeTopic};
 
 const DEFAULT_MAX_PACKET_SIZE: usize = 2 * 1024 * 1024;
 
@@ -191,6 +192,48 @@ impl Decoder for MqttCodec {
                 }))
             }
 
+            PacketType::Subscribe => {
+                // Il variable header di SUBSCRIBE ha obbligatoriamente il Packet ID (2 byte)
+                if body.remaining() < 2 {
+                    return Err(ProtocolError::Incomplete);
+                }
+                let packet_id = body.get_u16();
+
+                // Il payload contiene 1 o più tuple: [lunghezza_stringa + stringa + 1_byte_qos]
+                let mut topics = Vec::new();
+                while body.has_remaining() {
+                    let filter = Self::decode_string(&mut body)?;
+                    if body.remaining() < 1 {
+                        return Err(ProtocolError::Incomplete);
+                    }
+                    let qos_byte = body.get_u8();
+                    let qos = QoS::try_from(qos_byte)?;
+                    topics.push(crate::packet::SubscribeTopic { filter, qos });
+                }
+
+                if topics.is_empty() {
+                    // La specifica MQTT vieta un pacchetto SUBSCRIBE con payload vuoto
+                    return Err(ProtocolError::Incomplete);
+                }
+
+                Ok(Some(Packet::Subscribe { packet_id, topics }))
+            }
+
+            PacketType::SubAck => {
+                if body.remaining() < 2 {
+                    return Err(ProtocolError::Incomplete);
+                }
+                let packet_id = body.get_u16();
+
+                let mut return_codes = Vec::new();
+                while body.has_remaining() {
+                    let code = crate::packet::SubAckReturnCode::try_from(body.get_u8())?;
+                    return_codes.push(code);
+                }
+
+                Ok(Some(Packet::SubAck { packet_id, return_codes }))
+            }
+
             _ => Ok(None),
         }
     }
@@ -315,6 +358,45 @@ impl Encoder<Packet> for MqttCodec {
 
                 dst.put_slice(&payload);
             }
+
+            Packet::Subscribe { packet_id, topics } => {
+                // Fixed header flag per SUBSCRIBE: i bit 3..0 devono essere rigorosamente 0010 (0x02)
+                let first_byte = ((PacketType::Subscribe as u8) << 4) | 0x02;
+
+                let mut body = BytesMut::new();
+                body.put_u16(packet_id);
+
+                for topic in topics {
+                    Self::encode_string(&topic.filter, &mut body);
+                    body.put_u8(topic.qos as u8);
+                }
+
+                dst.put_u8(first_byte);
+                let mut varint_buf = Vec::with_capacity(4);
+                encode_varint(body.len(), &mut varint_buf)?;
+                dst.put_slice(&varint_buf);
+                dst.put(body);
+            }
+
+            Packet::SubAck { packet_id, return_codes } => {
+                let first_byte = (PacketType::SubAck as u8) << 4;
+
+                let mut body = BytesMut::new();
+                body.put_u16(packet_id);
+
+                for code in return_codes {
+                    body.put_u8(code as u8);
+                }
+
+                dst.put_u8(first_byte);
+                let mut varint_buf = Vec::with_capacity(4);
+                encode_varint(body.len(), &mut varint_buf)?;
+                dst.put_slice(&varint_buf);
+                dst.put(body);
+            }
+
+
+
         }
         Ok(())
     }
@@ -347,5 +429,40 @@ fn test_connect_and_connack_roundtrip() {
     codec.encode(connack.clone(), &mut buffer).unwrap();
     let decoded_ack = codec.decode(&mut buffer).unwrap();
     assert_eq!(decoded_ack, Some(connack));
+    assert!(buffer.is_empty());
+}
+
+#[test]
+fn test_subscribe_and_suback_roundtrip() {
+    let mut codec = MqttCodec::default();
+    let mut buffer = BytesMut::new();
+
+    let subscribe = Packet::Subscribe {
+        packet_id: 101,
+        topics: vec![
+            SubscribeTopic {
+                filter: "sensors/+/temperature".to_string(),
+                qos: QoS::AtLeastOnce,
+            },
+            SubscribeTopic {
+                filter: "alarms/#".to_string(),
+                qos: QoS::AtMostOnce,
+            },
+        ],
+    };
+
+    codec.encode(subscribe.clone(), &mut buffer).unwrap();
+    let decoded = codec.decode(&mut buffer).unwrap();
+    assert_eq!(decoded, Some(subscribe));
+    assert!(buffer.is_empty());
+
+    let suback = Packet::SubAck {
+        packet_id: 101,
+        return_codes: vec![SubAckReturnCode::SuccessQoS1, SubAckReturnCode::SuccessQoS0],
+    };
+
+    codec.encode(suback.clone(), &mut buffer).unwrap();
+    let decoded_ack = codec.decode(&mut buffer).unwrap();
+    assert_eq!(decoded_ack, Some(suback));
     assert!(buffer.is_empty());
 }

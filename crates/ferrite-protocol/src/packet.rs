@@ -122,6 +122,37 @@ impl TryFrom<u8> for PacketType {
     }
 }
 
+/// Represents a single topic filter and its requested maximum QoS in a SUBSCRIBE packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscribeTopic {
+    pub filter: String,
+    pub qos: QoS,
+}
+
+/// Return code for SUBACK response corresponding to each topic subscribed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SubAckReturnCode {
+    SuccessQoS0 = 0x00,
+    SuccessQoS1 = 0x01,
+    SuccessQoS2 = 0x02,
+    Failure = 0x80,
+}
+
+impl TryFrom<u8> for SubAckReturnCode {
+    type Error = ProtocolError;
+
+    fn try_from(val: u8) -> Result<Self, Self::Error> {
+        match val {
+            0x00 => Ok(SubAckReturnCode::SuccessQoS0),
+            0x01 => Ok(SubAckReturnCode::SuccessQoS1),
+            0x02 => Ok(SubAckReturnCode::SuccessQoS2),
+            0x80 => Ok(SubAckReturnCode::Failure),
+            other => Err(ProtocolError::InvalidPacketType(other)),
+        }
+    }
+}
+
 /// High-level strongly-typed MQTT packets.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -148,4 +179,13 @@ pub enum Packet {
         packet_id: Option<u16>,
         payload: Bytes,
     },
+    Subscribe {
+        packet_id: u16,
+        topics: Vec<SubscribeTopic>,
+    },
+    SubAck {
+        packet_id: u16,
+        return_codes: Vec<SubAckReturnCode>,
+    },
 }
+
