@@ -10,3 +10,5 @@ ferrite-protocol.workspace = true
 bytes.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tokio-util.workspace = true
+futures.workspace = true

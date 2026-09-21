@@ -1,5 +1,5 @@
 use ferrite_protocol::QoS;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Rappresenta una sottoscrizione effettuata da un client a un topic filter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

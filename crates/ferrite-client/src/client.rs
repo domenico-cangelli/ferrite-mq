@@ -34,6 +34,11 @@ pub struct AsyncClient {
 }
 
 impl AsyncClient {
+
+    pub fn next_packet_id(&self) -> u16 {
+        self.packet_id_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Invia un messaggio su uno specifico topic con QoS 0 (Fire & Forget)
     pub async fn publish<T: Into<String>, P: Into<Bytes>>(
         &self,
@@ -124,7 +129,7 @@ pub async fn connect(
         Some(Ok(Packet::ConnAck { return_code, .. })) => {
             return Err(ClientError::ConnectionRefused(return_code));
         }
-        Some(Ok(unexpected)) => {
+        Some(Ok(_unexpected)) => {
             return Err(ClientError::Protocol(
                 ferrite_protocol::ProtocolError::InvalidPacketType(0),
             ));

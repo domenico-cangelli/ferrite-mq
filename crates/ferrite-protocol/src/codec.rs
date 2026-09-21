@@ -4,7 +4,6 @@ use crate::varint::{decode_varint, encode_varint};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::str;
 use tokio_util::codec::{Decoder, Encoder};
-use crate::{SubAckReturnCode, SubscribeTopic};
 
 const DEFAULT_MAX_PACKET_SIZE: usize = 2 * 1024 * 1024;
 
@@ -440,11 +439,11 @@ fn test_subscribe_and_suback_roundtrip() {
     let subscribe = Packet::Subscribe {
         packet_id: 101,
         topics: vec![
-            SubscribeTopic {
+            crate::SubscribeTopic {
                 filter: "sensors/+/temperature".to_string(),
                 qos: QoS::AtLeastOnce,
             },
-            SubscribeTopic {
+            crate::SubscribeTopic {
                 filter: "alarms/#".to_string(),
                 qos: QoS::AtMostOnce,
             },
@@ -458,7 +457,7 @@ fn test_subscribe_and_suback_roundtrip() {
 
     let suback = Packet::SubAck {
         packet_id: 101,
-        return_codes: vec![SubAckReturnCode::SuccessQoS1, SubAckReturnCode::SuccessQoS0],
+        return_codes: vec![crate::SubAckReturnCode::SuccessQoS1, crate::SubAckReturnCode::SuccessQoS0],
     };
 
     codec.encode(suback.clone(), &mut buffer).unwrap();
