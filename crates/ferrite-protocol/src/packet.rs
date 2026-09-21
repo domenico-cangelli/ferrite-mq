@@ -3,7 +3,7 @@ use bytes::Bytes;
 use crate::QoS::{AtLeastOnce, AtMostOnce, ExactlyOnce};
 
 /// MQTT Quality of Service levels according to OASIS specification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum QoS {
     /// QoS 0: At most once delivery (Fire and forget)
