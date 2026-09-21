@@ -6,8 +6,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::{timeout, Duration};
 use tokio_util::codec::Framed;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 type ClientSender = mpsc::Sender<Packet>;
 
@@ -17,8 +18,9 @@ pub struct BrokerState {
     pub sessions: Arc<RwLock<HashMap<String, ClientSender>>>,
 }
 
-/// Avvia il loop di accettazione connessioni su un listener già aperto
-pub async fn run_server(listener: TcpListener) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run_server(
+    listener: TcpListener,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = BrokerState::default();
 
     loop {
@@ -45,15 +47,28 @@ async fn handle_client(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut framed = Framed::new(stream, MqttCodec::default());
 
-    let client_id = match framed.next().await {
-        Some(Ok(Packet::Connect { client_id, .. })) => {
+    // 1. Handshake iniziale: estraiamo anche il valore di keep_alive
+    let (client_id, keep_alive_duration) = match framed.next().await {
+        Some(Ok(Packet::Connect {
+                    client_id,
+                    keep_alive,
+                    ..
+                })) => {
             framed
                 .send(Packet::ConnAck {
                     session_present: false,
                     return_code: ConnectReturnCode::Accepted,
                 })
                 .await?;
-            client_id
+
+            // Specifica MQTT: timeout effettivo = keep_alive * 1.5
+            let duration = if keep_alive > 0 {
+                Duration::from_millis((keep_alive as u64 * 1500).max(500))
+            } else {
+                Duration::from_secs(u64::MAX / 2) // Keep-alive disabilitato
+            };
+
+            (client_id, duration)
         }
         _ => return Ok(()),
     };
@@ -69,16 +84,25 @@ async fn handle_client(
 
     loop {
         tokio::select! {
+            // Messaggi in uscita dalla coda interna (es. pubblicazioni di altri)
             Some(outgoing) = rx.recv() => {
                 framed.send(outgoing).await?;
             }
 
-            incoming = framed.next() => {
-                match incoming {
-                    Some(Ok(Packet::PingReq)) => {
+            // Pacchetti in arrivo dalla rete protetti da timeout di inattività
+            network_event = timeout(keep_alive_duration, framed.next()) => {
+                match network_event {
+                    // Errore di timeout: il client non ha mandato nulla entro keep_alive * 1.5
+                    Err(_) => {
+                        warn!("Client [{}] timed out (inactivity timeout)", client_id);
+                        break;
+                    }
+
+                    // Arrivato un pacchetto valido prima della scadenza
+                    Ok(Some(Ok(Packet::PingReq))) => {
                         framed.send(Packet::PingResp).await?;
                     }
-                    Some(Ok(Packet::Subscribe { packet_id, topics })) => {
+                    Ok(Some(Ok(Packet::Subscribe { packet_id, topics }))) => {
                         let mut return_codes = Vec::new();
                         let mut trie = state.trie.write().await;
                         for topic in topics {
@@ -88,7 +112,7 @@ async fn handle_client(
                         }
                         framed.send(Packet::SubAck { packet_id, return_codes }).await?;
                     }
-                    Some(Ok(Packet::Publish { topic, qos: _, retain, dup, packet_id, payload })) => {
+                    Ok(Some(Ok(Packet::Publish { topic, retain, dup, packet_id, payload, .. }))) => {
                         let matched = {
                             let trie = state.trie.read().await;
                             trie.match_topic(&topic)
@@ -110,13 +134,18 @@ async fn handle_client(
                             }
                         }
                     }
-                    Some(Ok(Packet::Disconnect)) | None => break,
+                    Ok(Some(Ok(Packet::Disconnect))) | Ok(None) => break,
+                    Ok(Some(Err(e))) => {
+                        warn!("Protocol error from [{}]: {:?}", client_id, e);
+                        break;
+                    }
                     _ => {}
                 }
             }
         }
     }
 
+    // Pulizia garantita alla chiusura della connessione
     {
         let mut trie = state.trie.write().await;
         for filter in subscribed_filters {
@@ -126,5 +155,6 @@ async fn handle_client(
         sessions.remove(&client_id);
     }
 
+    info!("Session cleaned up for [{}]", client_id);
     Ok(())
 }

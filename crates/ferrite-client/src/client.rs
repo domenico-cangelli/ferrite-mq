@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time::{interval, Duration};
 use tokio_util::codec::Framed;
 
-/// Comandi interni inviati dall'interfaccia Client al Driver di connessione
 #[derive(Debug)]
 pub enum ClientCommand {
     Publish {
@@ -26,7 +26,6 @@ pub enum ClientCommand {
     Disconnect,
 }
 
-/// Handle ad alto livello per interagire con il broker MQTT
 #[derive(Clone)]
 pub struct AsyncClient {
     command_tx: mpsc::Sender<ClientCommand>,
@@ -34,12 +33,10 @@ pub struct AsyncClient {
 }
 
 impl AsyncClient {
-
     pub fn next_packet_id(&self) -> u16 {
         self.packet_id_counter.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Invia un messaggio su uno specifico topic con QoS 0 (Fire & Forget)
     pub async fn publish<T: Into<String>, P: Into<Bytes>>(
         &self,
         topic: T,
@@ -57,7 +54,6 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Sottoscrive un topic filter con il livello di QoS richiesto
     pub async fn subscribe<T: Into<String>>(&self, filter: T, qos: QoS) -> Result<(), ClientError> {
         self.command_tx
             .send(ClientCommand::Subscribe {
@@ -70,7 +66,6 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Disconnette in modo pulito il client
     pub async fn disconnect(&self) -> Result<(), ClientError> {
         self.command_tx
             .send(ClientCommand::Disconnect)
@@ -81,7 +76,6 @@ impl AsyncClient {
     }
 }
 
-/// Opzioni di configurazione per il client
 #[derive(Debug, Clone)]
 pub struct MqttOptions {
     pub client_id: String,
@@ -101,15 +95,12 @@ impl MqttOptions {
     }
 }
 
-/// Stabilisce la connessione con il broker, esegue l'handshake CONNECT/CONNACK
-/// e restituisce l'Handle client insieme all'EventLoop per ricevere i messaggi in ingresso.
 pub async fn connect(
     options: MqttOptions,
 ) -> Result<(AsyncClient, mpsc::Receiver<Packet>), ClientError> {
     let stream = TcpStream::connect(options.broker_addr).await?;
     let mut framed = Framed::new(stream, MqttCodec::default());
 
-    // 1. Invio del frame CONNECT
     let connect_packet = Packet::Connect {
         protocol_version: ProtocolVersion::Mqtt311,
         clean_session: options.clean_session,
@@ -120,7 +111,6 @@ pub async fn connect(
     };
     framed.send(connect_packet).await?;
 
-    // 2. Attesa del CONNACK di risposta
     match framed.next().await {
         Some(Ok(Packet::ConnAck {
                     return_code: ConnectReturnCode::Accepted,
@@ -138,20 +128,36 @@ pub async fn connect(
         None => return Err(ClientError::ConnectionClosed),
     }
 
-    // Canale per inoltrare i comandi dall'AsyncClient al Connection Driver
     let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(100);
-
-    // Canale per inoltrare i pacchetti ricevuti dalla rete all'applicazione utente
     let (incoming_tx, incoming_rx) = mpsc::channel::<Packet>(100);
 
     let packet_id_counter = Arc::new(AtomicU16::new(1));
     let id_gen = packet_id_counter.clone();
 
-    // 3. Spawna il Driver asincrono che supervisiona I/O di rete e comandi utente
+    // Impostiamo l'intervallo di Keep-Alive.
+    // Se keep_alive è > 0, inviamo il ping al 75% della finestra temporale (calcolato in millisecondi)
+    // garantendo che la durata sia sempre strettamente positiva (> 0 ms).
+    let ping_duration = if options.keep_alive > 0 {
+        let millis = (options.keep_alive as u64 * 1000 * 3) / 4;
+        Duration::from_millis(millis).max(Duration::from_millis(250))
+    } else {
+        Duration::from_secs(u64::MAX / 2)
+    };
+
+    let mut ping_interval = interval(ping_duration);
+    // Il primo tick scatta immediatamente: lo consumiamo subito per evitare un PING istantaneo
+    ping_interval.tick().await;
+
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                // Comandi inviati tramite l'AsyncClient
+                // Heartbeat periodico per mantenere attiva la connessione TCP
+                _ = ping_interval.tick(), if options.keep_alive > 0 => {
+                    if framed.send(Packet::PingReq).await.is_err() {
+                        break;
+                    }
+                }
+
                 Some(cmd) = command_rx.recv() => {
                     match cmd {
                         ClientCommand::Publish { topic, qos, payload } => {
@@ -184,12 +190,10 @@ pub async fn connect(
                     }
                 }
 
-                // Pacchetti in arrivo dal broker sulla socket TCP
                 Some(incoming) = framed.next() => {
                     match incoming {
                         Ok(packet) => {
                             if incoming_tx.send(packet).await.is_err() {
-                                // L'utente ha deallocato la coda di ricezione
                                 break;
                             }
                         }
