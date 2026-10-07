@@ -17,4 +17,7 @@ pub enum ClientError {
 
     #[error("Connection closed by peer")]
     ConnectionClosed,
+
+    #[error("Acknowledgement channel dropped before receiving PUBACK")]
+    AckChannelDropped,
 }

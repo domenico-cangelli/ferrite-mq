@@ -4,20 +4,27 @@ use ferrite_protocol::{
     ConnectReturnCode, MqttCodec, Packet, ProtocolVersion, QoS, SubscribeTopic,
 };
 use futures::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, Duration};
 use tokio_util::codec::Framed;
 
+/// Comandi interni inviati dall'interfaccia Client al Driver di connessione
 #[derive(Debug)]
 pub enum ClientCommand {
-    Publish {
+    PublishQoS0 {
         topic: String,
-        qos: QoS,
         payload: Bytes,
+    },
+    PublishQoS1 {
+        packet_id: u16,
+        topic: String,
+        payload: Bytes,
+        ack_sender: oneshot::Sender<()>,
     },
     Subscribe {
         filter: String,
@@ -26,6 +33,7 @@ pub enum ClientCommand {
     Disconnect,
 }
 
+/// Handle ad alto livello per interagire con il broker MQTT
 #[derive(Clone)]
 pub struct AsyncClient {
     command_tx: mpsc::Sender<ClientCommand>,
@@ -34,18 +42,24 @@ pub struct AsyncClient {
 
 impl AsyncClient {
     pub fn next_packet_id(&self) -> u16 {
-        self.packet_id_counter.fetch_add(1, Ordering::Relaxed)
+        // I Packet ID in MQTT vanno da 1 a 65535 (0 è riservato/invalido)
+        let id = self.packet_id_counter.fetch_add(1, Ordering::Relaxed);
+        if id == 0 {
+            self.packet_id_counter.fetch_add(1, Ordering::Relaxed)
+        } else {
+            id
+        }
     }
 
+    /// Invia un messaggio a QoS 0 (Fire & Forget)
     pub async fn publish<T: Into<String>, P: Into<Bytes>>(
         &self,
         topic: T,
         payload: P,
     ) -> Result<(), ClientError> {
         self.command_tx
-            .send(ClientCommand::Publish {
+            .send(ClientCommand::PublishQoS0 {
                 topic: topic.into(),
-                qos: QoS::AtMostOnce,
                 payload: payload.into(),
             })
             .await
@@ -54,6 +68,32 @@ impl AsyncClient {
         Ok(())
     }
 
+    /// Invia un messaggio a QoS 1 (At Least Once) e attende il relativo PUBACK dal broker
+    pub async fn publish_qos1<T: Into<String>, P: Into<Bytes>>(
+        &self,
+        topic: T,
+        payload: P,
+    ) -> Result<(), ClientError> {
+        let packet_id = self.next_packet_id();
+        let (ack_tx, ack_rx) = oneshot::channel();
+
+        self.command_tx
+            .send(ClientCommand::PublishQoS1 {
+                packet_id,
+                topic: topic.into(),
+                payload: payload.into(),
+                ack_sender: ack_tx,
+            })
+            .await
+            .map_err(|_| ClientError::ChannelClosed)?;
+
+        // Attende che il Connection Driver riceva il PUBACK corrispondente
+        ack_rx.await.map_err(|_| ClientError::AckChannelDropped)?;
+
+        Ok(())
+    }
+
+    /// Sottoscrive un topic filter con il livello di QoS specificato
     pub async fn subscribe<T: Into<String>>(&self, filter: T, qos: QoS) -> Result<(), ClientError> {
         self.command_tx
             .send(ClientCommand::Subscribe {
@@ -66,6 +106,7 @@ impl AsyncClient {
         Ok(())
     }
 
+    /// Disconnette in modo pulito il client
     pub async fn disconnect(&self) -> Result<(), ClientError> {
         self.command_tx
             .send(ClientCommand::Disconnect)
@@ -76,6 +117,7 @@ impl AsyncClient {
     }
 }
 
+/// Opzioni di configurazione per il client
 #[derive(Debug, Clone)]
 pub struct MqttOptions {
     pub client_id: String,
@@ -134,9 +176,6 @@ pub async fn connect(
     let packet_id_counter = Arc::new(AtomicU16::new(1));
     let id_gen = packet_id_counter.clone();
 
-    // Impostiamo l'intervallo di Keep-Alive.
-    // Se keep_alive è > 0, inviamo il ping al 75% della finestra temporale (calcolato in millisecondi)
-    // garantendo che la durata sia sempre strettamente positiva (> 0 ms).
     let ping_duration = if options.keep_alive > 0 {
         let millis = (options.keep_alive as u64 * 1000 * 3) / 4;
         Duration::from_millis(millis).max(Duration::from_millis(250))
@@ -145,13 +184,14 @@ pub async fn connect(
     };
 
     let mut ping_interval = interval(ping_duration);
-    // Il primo tick scatta immediatamente: lo consumiamo subito per evitare un PING istantaneo
     ping_interval.tick().await;
 
     tokio::spawn(async move {
+        // Mappa dei pacchetti QoS 1 in volo in attesa di PUBACK
+        let mut pending_acks: HashMap<u16, oneshot::Sender<()>> = HashMap::new();
+
         loop {
             tokio::select! {
-                // Heartbeat periodico per mantenere attiva la connessione TCP
                 _ = ping_interval.tick(), if options.keep_alive > 0 => {
                     if framed.send(Packet::PingReq).await.is_err() {
                         break;
@@ -160,13 +200,27 @@ pub async fn connect(
 
                 Some(cmd) = command_rx.recv() => {
                     match cmd {
-                        ClientCommand::Publish { topic, qos, payload } => {
+                        ClientCommand::PublishQoS0 { topic, payload } => {
                             let packet = Packet::Publish {
                                 topic,
-                                qos,
+                                qos: QoS::AtMostOnce,
                                 retain: false,
                                 dup: false,
                                 packet_id: None,
+                                payload,
+                            };
+                            if framed.send(packet).await.is_err() {
+                                break;
+                            }
+                        }
+                        ClientCommand::PublishQoS1 { packet_id, topic, payload, ack_sender } => {
+                            pending_acks.insert(packet_id, ack_sender);
+                            let packet = Packet::Publish {
+                                topic,
+                                qos: QoS::AtLeastOnce,
+                                retain: false,
+                                dup: false,
+                                packet_id: Some(packet_id),
                                 payload,
                             };
                             if framed.send(packet).await.is_err() {
@@ -192,6 +246,12 @@ pub async fn connect(
 
                 Some(incoming) = framed.next() => {
                     match incoming {
+                        Ok(Packet::PubAck { packet_id }) => {
+                            // Se un oneshot::Sender è registrato per questo ID, inviamo la notifica
+                            if let Some(ack_tx) = pending_acks.remove(&packet_id) {
+                                let _ = ack_tx.send(());
+                            }
+                        }
                         Ok(packet) => {
                             if incoming_tx.send(packet).await.is_err() {
                                 break;

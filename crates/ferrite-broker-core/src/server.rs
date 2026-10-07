@@ -112,24 +112,51 @@ async fn handle_client(
                         }
                         framed.send(Packet::SubAck { packet_id, return_codes }).await?;
                     }
-                    Ok(Some(Ok(Packet::Publish { topic, retain, dup, packet_id, payload, .. }))) => {
+                    Ok(Some(Ok(Packet::Publish {
+                        topic,
+                        qos,
+                        retain,
+                        dup,
+                        packet_id,
+                        payload,
+                    }))) => {
+                        // 1. Regola QoS 1: se il messaggio ricevuto è AtLeastOnce,
+                        // dobbiamo confermarne la ricezione al publisher inviando PUBACK con lo stesso ID.
+                        if qos == ferrite_protocol::QoS::AtLeastOnce {
+                            if let Some(id) = packet_id {
+                                if let Err(e) = framed.send(Packet::PubAck { packet_id: id }).await {
+                                    warn!("[{}] Failed to send PUBACK: {:?}", client_id, e);
+                                    break;
+                                }
+                            } else {
+                                warn!("[{}] Received QoS 1 PUBLISH without packet_id, protocol violation", client_id);
+                                break;
+                            }
+                        }
+
+                        // 2. Lookup nel TopicTrie per trovare chi è iscritto
                         let matched = {
                             let trie = state.trie.read().await;
                             trie.match_topic(&topic)
                         };
 
+                        // 3. Instradamento ai subscriber trovati
                         if !matched.is_empty() {
                             let sessions = state.sessions.read().await;
                             for sub in matched {
                                 if let Some(target_tx) = sessions.get(&sub.client_id) {
-                                    let _ = target_tx.send(Packet::Publish {
-                                        topic: topic.clone(),
-                                        qos: sub.qos,
-                                        retain,
-                                        dup,
-                                        packet_id,
-                                        payload: payload.clone(),
-                                    }).await;
+                                    let _ = target_tx
+                                        .send(Packet::Publish {
+                                            topic: topic.clone(),
+                                            // Il QoS 1 in uscita non è ancora supportato (servirebbe un
+                                            // packet_id dedicato): consegniamo a QoS 0.
+                                            qos: ferrite_protocol::QoS::AtMostOnce,
+                                            retain,
+                                            dup,
+                                            packet_id: None,
+                                            payload: payload.clone(),
+                                        })
+                                        .await;
                                 }
                             }
                         }

@@ -233,6 +233,15 @@ impl Decoder for MqttCodec {
                 Ok(Some(Packet::SubAck { packet_id, return_codes }))
             }
 
+            PacketType::PubAck => {
+                // PUBACK deve contenere esattamente il packet_id a 2 byte
+                if body.remaining() < 2 {
+                    return Err(ProtocolError::Incomplete);
+                }
+                let packet_id = body.get_u16();
+                Ok(Some(Packet::PubAck { packet_id }))
+            }
+
             _ => Ok(None),
         }
     }
@@ -394,6 +403,15 @@ impl Encoder<Packet> for MqttCodec {
                 dst.put(body);
             }
 
+            Packet::PubAck { packet_id } => {
+                // Fixed Header: tipo 4 (0x40)
+                dst.put_u8((PacketType::PubAck as u8) << 4);
+                // Remaining Length: esattamente 2 byte (la dimensione dell'u16 packet_id)
+                dst.put_u8(2);
+                // Variable Header: Packet Identifier
+                dst.put_u16(packet_id);
+            }
+
 
 
         }
@@ -463,5 +481,42 @@ fn test_subscribe_and_suback_roundtrip() {
     codec.encode(suback.clone(), &mut buffer).unwrap();
     let decoded_ack = codec.decode(&mut buffer).unwrap();
     assert_eq!(decoded_ack, Some(suback));
+    assert!(buffer.is_empty());
+}
+
+#[test]
+fn test_puback_roundtrip() {
+    let mut codec = MqttCodec::default();
+    let mut buffer = BytesMut::new();
+
+    let original = Packet::PubAck { packet_id: 1054 };
+
+    // Serializzazione
+    codec.encode(original.clone(), &mut buffer).unwrap();
+    // Fixed header (0x40), Remaining Length (0x02), Packet ID (0x04, 0x1E per 1054)
+    assert_eq!(&buffer[..], &[0x40, 0x02, 0x04, 0x1E]);
+
+    // Deserializzazione
+    let decoded = codec.decode(&mut buffer).unwrap();
+    assert_eq!(decoded, Some(original));
+    assert!(buffer.is_empty());
+}
+
+#[test]
+fn test_puback_incomplete_buffer() {
+    let mut codec = MqttCodec::default();
+    let mut buffer = BytesMut::new();
+
+    // Inviamo solo header fisso e il primo byte del packet ID (manca 1 byte)
+    buffer.put_slice(&[0x40, 0x02, 0x00]);
+
+    // Il codec non deve andare in errore ma restituire None (attesa dati)
+    let result = codec.decode(&mut buffer).unwrap();
+    assert_eq!(result, None);
+
+    // Aggiungiamo il byte mancante
+    buffer.put_u8(0x2A); // ID: 42
+    let result = codec.decode(&mut buffer).unwrap();
+    assert_eq!(result, Some(Packet::PubAck { packet_id: 42 }));
     assert!(buffer.is_empty());
 }

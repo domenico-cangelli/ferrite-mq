@@ -131,3 +131,104 @@ async fn test_broker_disconnects_inactive_client() {
         Err(_) => panic!("Il broker non ha disconnesso il client entro la finestra temporale prevista"),
     }
 }
+
+
+#[tokio::test]
+async fn test_broker_puback_response_for_qos1() {
+    let broker_addr = start_test_broker().await;
+
+    // Connessione diretta via socket raw per verificare il frame di risposta del broker
+    let stream = tokio::net::TcpStream::connect(broker_addr).await.unwrap();
+    let mut framed = Framed::new(stream, MqttCodec::default());
+
+    // 1. Handshake CONNECT
+    framed
+        .send(Packet::Connect {
+            protocol_version: ProtocolVersion::Mqtt311,
+            clean_session: true,
+            keep_alive: 60,
+            client_id: "qos1-tester".into(),
+            username: None,
+            password: None,
+        })
+        .await
+        .unwrap();
+
+    let connack = framed.next().await.unwrap().unwrap();
+    assert!(matches!(connack, Packet::ConnAck { .. }));
+
+    // 2. Invio di un PUBLISH a QoS 1 con packet_id = 42
+    framed
+        .send(Packet::Publish {
+            topic: "telemetry/vibration".into(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            dup: false,
+            packet_id: Some(42),
+            payload: Bytes::from_static(b"critical_vibration_alert"),
+        })
+        .await
+        .unwrap();
+
+    // 3. Verifica ricezione del PUBACK corrispondente
+    let response = timeout(Duration::from_secs(2), framed.next())
+        .await
+        .expect("Timeout waiting for PUBACK")
+        .expect("Connection closed prematurely")
+        .expect("Protocol decode error");
+
+    assert_eq!(response, Packet::PubAck { packet_id: 42 });
+}
+
+#[tokio::test]
+async fn test_client_publish_qos1_with_ack() {
+    let broker_addr = start_test_broker().await;
+
+    // 1. Connetti subscriber
+    let sub_opts = MqttOptions::new("sub-qos1", broker_addr);
+    let (sub_client, mut sub_rx) = connect(sub_opts).await.unwrap();
+
+    sub_client
+        .subscribe("orders/processed", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+
+    // Attendi SUBACK
+    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(suback, Packet::SubAck { .. }));
+
+    // 2. Connetti publisher
+    let pub_opts = MqttOptions::new("pub-qos1", broker_addr);
+    let (pub_client, _pub_rx) = connect(pub_opts).await.unwrap();
+
+    // 3. Pubblica con publish_qos1: la chiamata completa solo se il broker invia PUBACK
+    let payload = Bytes::from_static(b"order_id_8941");
+    let pub_result = timeout(
+        Duration::from_secs(2),
+        pub_client.publish_qos1("orders/processed", payload.clone()),
+    )
+        .await;
+
+    assert!(pub_result.is_ok(), "publish_qos1 timed out waiting for PUBACK");
+    pub_result.unwrap().expect("publish_qos1 failed");
+
+    // 4. Verifica che il subscriber riceva il payload
+    let received = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    match received {
+        Packet::Publish { topic, payload: p, .. } => {
+            assert_eq!(topic, "orders/processed");
+            assert_eq!(p, payload);
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
+
+    sub_client.disconnect().await.unwrap();
+    pub_client.disconnect().await.unwrap();
+}

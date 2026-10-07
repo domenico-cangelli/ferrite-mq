@@ -187,5 +187,8 @@ pub enum Packet {
         packet_id: u16,
         return_codes: Vec<SubAckReturnCode>,
     },
+    PubAck {
+        packet_id: u16,
+    }
 }
 
