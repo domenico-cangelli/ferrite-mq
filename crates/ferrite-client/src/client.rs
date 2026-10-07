@@ -40,15 +40,26 @@ pub struct AsyncClient {
     packet_id_counter: Arc<AtomicU16>,
 }
 
+/// Restituisce il prossimo Packet ID MQTT, nell'intervallo [1, 65535].
+///
+/// Usa `fetch_update` (compare-and-swap in un ciclo) così lettura e aggiornamento
+/// del contatore sono un'unica operazione atomica: due thread concorrenti non
+/// possono mai ottenere lo stesso ID, e il valore 0 (invalido in MQTT) non viene
+/// mai memorizzato nel contatore, quindi non può mai essere restituito.
+fn next_id(counter: &AtomicU16) -> u16 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            // Dopo 65535 si riparte da 1, saltando lo 0.
+            Some(if current == u16::MAX { 1 } else { current + 1 })
+        })
+        // La closure ritorna sempre Some, quindi fetch_update non può fallire.
+        // Il valore restituito è quello *precedente*, cioè l'ID da usare.
+        .expect("la closure restituisce sempre Some")
+}
+
 impl AsyncClient {
     pub fn next_packet_id(&self) -> u16 {
-        // I Packet ID in MQTT vanno da 1 a 65535 (0 è riservato/invalido)
-        let id = self.packet_id_counter.fetch_add(1, Ordering::Relaxed);
-        if id == 0 {
-            self.packet_id_counter.fetch_add(1, Ordering::Relaxed)
-        } else {
-            id
-        }
+        next_id(&self.packet_id_counter)
     }
 
     /// Invia un messaggio a QoS 0 (Fire & Forget)
@@ -148,6 +159,7 @@ pub async fn connect(
         clean_session: options.clean_session,
         keep_alive: options.keep_alive,
         client_id: options.client_id,
+        will: None,
         username: None,
         password: None,
     };
@@ -228,7 +240,7 @@ pub async fn connect(
                             }
                         }
                         ClientCommand::Subscribe { filter, qos } => {
-                            let packet_id = id_gen.fetch_add(1, Ordering::Relaxed);
+                            let packet_id = next_id(&id_gen);
                             let packet = Packet::Subscribe {
                                 packet_id,
                                 topics: vec![SubscribeTopic { filter, qos }],
@@ -272,4 +284,55 @@ pub async fn connect(
     };
 
     Ok((client, incoming_rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::thread;
+
+    #[test]
+    fn test_packet_id_starts_at_one_and_increments() {
+        let counter = AtomicU16::new(1);
+        assert_eq!(next_id(&counter), 1);
+        assert_eq!(next_id(&counter), 2);
+        assert_eq!(next_id(&counter), 3);
+    }
+
+    #[test]
+    fn test_packet_id_wraps_and_skips_zero() {
+        let counter = AtomicU16::new(u16::MAX);
+        assert_eq!(next_id(&counter), u16::MAX);
+        // Dopo 65535 si riparte da 1: lo 0 non deve mai uscire.
+        assert_eq!(next_id(&counter), 1);
+        assert_eq!(next_id(&counter), 2);
+    }
+
+    #[test]
+    fn test_packet_id_never_zero_over_full_cycle() {
+        let counter = AtomicU16::new(1);
+        for _ in 0..(u16::MAX as u32 * 2) {
+            assert_ne!(next_id(&counter), 0);
+        }
+    }
+
+    #[test]
+    fn test_packet_id_unique_across_threads() {
+        let counter = Arc::new(AtomicU16::new(1));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let counter = counter.clone();
+                thread::spawn(move || (0..1000).map(|_| next_id(&counter)).collect::<Vec<_>>())
+            })
+            .collect();
+
+        let mut seen = HashSet::new();
+        for handle in handles {
+            for id in handle.join().unwrap() {
+                assert!(seen.insert(id), "ID duplicato: {id}");
+            }
+        }
+        assert_eq!(seen.len(), 8000);
+    }
 }

@@ -7,4 +7,5 @@ pub use codec::MqttCodec;
 pub use error::ProtocolError;
 pub use packet::{
     ConnectReturnCode, Packet, PacketType, ProtocolVersion, QoS, SubAckReturnCode, SubscribeTopic,
+    Will,
 };

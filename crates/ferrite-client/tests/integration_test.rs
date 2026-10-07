@@ -111,6 +111,7 @@ async fn test_broker_disconnects_inactive_client() {
         clean_session: true,
         keep_alive: 1,
         client_id: "lazy-client".into(),
+        will: None,
         username: None,
         password: None,
     };
@@ -148,6 +149,7 @@ async fn test_broker_puback_response_for_qos1() {
             clean_session: true,
             keep_alive: 60,
             client_id: "qos1-tester".into(),
+            will: None,
             username: None,
             password: None,
         })
@@ -231,4 +233,204 @@ async fn test_client_publish_qos1_with_ack() {
 
     sub_client.disconnect().await.unwrap();
     pub_client.disconnect().await.unwrap();
+}
+#[tokio::test]
+async fn test_broker_suback_reports_granted_qos() {
+    let broker_addr = start_test_broker().await;
+
+    let stream = tokio::net::TcpStream::connect(broker_addr).await.unwrap();
+    let mut framed = Framed::new(stream, MqttCodec::default());
+
+    framed
+        .send(Packet::Connect {
+            protocol_version: ProtocolVersion::Mqtt311,
+            clean_session: true,
+            keep_alive: 60,
+            client_id: "suback-tester".into(),
+            will: None,
+            username: None,
+            password: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        framed.next().await.unwrap().unwrap(),
+        Packet::ConnAck { .. }
+    ));
+
+    framed
+        .send(Packet::Subscribe {
+            packet_id: 7,
+            topics: vec![
+                ferrite_protocol::SubscribeTopic {
+                    filter: "a/b".into(),
+                    qos: QoS::AtMostOnce,
+                },
+                ferrite_protocol::SubscribeTopic {
+                    filter: "c/d".into(),
+                    qos: QoS::ExactlyOnce,
+                },
+            ],
+        })
+        .await
+        .unwrap();
+
+    let response = timeout(Duration::from_secs(2), framed.next())
+        .await
+        .expect("Timeout waiting for SUBACK")
+        .unwrap()
+        .unwrap();
+
+    match response {
+        Packet::SubAck { packet_id, return_codes } => {
+            assert_eq!(packet_id, 7);
+            // Un return code per ogni filtro, mai oltre quanto richiesto.
+            assert_eq!(return_codes.len(), 2);
+            assert_eq!(return_codes[0], ferrite_protocol::SubAckReturnCode::SuccessQoS0);
+            assert_ne!(return_codes[1], ferrite_protocol::SubAckReturnCode::Failure);
+        }
+        other => panic!("Expected SubAck, got {:?}", other),
+    }
+}
+
+/// Apre una connessione raw verso il broker ed esegue l'handshake CONNECT/CONNACK.
+async fn raw_connect(
+    broker_addr: SocketAddr,
+    client_id: &str,
+    keep_alive: u16,
+) -> Framed<tokio::net::TcpStream, MqttCodec> {
+    let stream = tokio::net::TcpStream::connect(broker_addr).await.unwrap();
+    let mut framed = Framed::new(stream, MqttCodec::default());
+
+    framed
+        .send(Packet::Connect {
+            protocol_version: ProtocolVersion::Mqtt311,
+            clean_session: true,
+            keep_alive,
+            client_id: client_id.into(),
+            will: None,
+            username: None,
+            password: None,
+        })
+        .await
+        .unwrap();
+
+    let connack = framed.next().await.unwrap().unwrap();
+    assert!(matches!(connack, Packet::ConnAck { .. }));
+    framed
+}
+
+#[tokio::test]
+async fn test_outgoing_traffic_does_not_reset_inactivity_watchdog() {
+    let broker_addr = start_test_broker().await;
+
+    // Subscriber "muto": keep_alive = 1s (timeout broker = 1.5s), dopo la SUBSCRIBE non invia più nulla.
+    let mut silent = raw_connect(broker_addr, "silent-subscriber", 1).await;
+    silent
+        .send(Packet::Subscribe {
+            packet_id: 1,
+            topics: vec![ferrite_protocol::SubscribeTopic {
+                filter: "noise".into(),
+                qos: QoS::AtMostOnce,
+            }],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        silent.next().await.unwrap().unwrap(),
+        Packet::SubAck { .. }
+    ));
+
+    // Un publisher invia un messaggio ogni 200ms per ~4s: il traffico *in uscita* verso
+    // il subscriber non deve mantenerlo in vita.
+    let (pub_client, _pub_rx) = connect(MqttOptions::new("noise-publisher", broker_addr))
+        .await
+        .unwrap();
+    let publisher = tokio::spawn(async move {
+        for _ in 0..20 {
+            let _ = pub_client.publish("noise", Bytes::from_static(b"x")).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let closed = timeout(Duration::from_secs(3), async {
+        while silent.next().await.is_some() {}
+    })
+    .await;
+    publisher.abort();
+
+    assert!(
+        closed.is_ok(),
+        "il broker non ha disconnesso il client silenzioso: il traffico in uscita ha azzerato il watchdog"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[tokio::test]
+async fn test_duplicate_client_id_disconnects_old_connection() {
+    let broker_addr = start_test_broker().await;
+
+    // Vecchia connessione, iscritta a "old/topic"
+    let mut old = raw_connect(broker_addr, "dup-client", 60).await;
+    old.send(Packet::Subscribe {
+        packet_id: 1,
+        topics: vec![ferrite_protocol::SubscribeTopic {
+            filter: "old/topic".into(),
+            qos: QoS::AtMostOnce,
+        }],
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        old.next().await.unwrap().unwrap(),
+        Packet::SubAck { .. }
+    ));
+
+    // Nuova connessione con lo stesso client_id
+    let (new_client, mut new_rx) = connect(MqttOptions::new("dup-client", broker_addr))
+        .await
+        .unwrap();
+
+    // MQTT-3.1.4-2: il broker deve chiudere la connessione precedente
+    let closed = timeout(Duration::from_secs(2), old.next())
+        .await
+        .expect("il broker non ha chiuso la vecchia connessione con lo stesso client_id");
+    assert!(closed.is_none());
+
+    // La nuova connessione deve funzionare, anche dopo la pulizia della vecchia
+    new_client
+        .subscribe("new/topic", QoS::AtMostOnce)
+        .await
+        .unwrap();
+    let suback = timeout(Duration::from_secs(2), new_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(suback, Packet::SubAck { .. }));
+
+    let (pub_client, _pub_rx) = connect(MqttOptions::new("dup-publisher", broker_addr))
+        .await
+        .unwrap();
+    pub_client
+        .publish("old/topic", Bytes::from_static(b"stale"))
+        .await
+        .unwrap();
+    pub_client
+        .publish("new/topic", Bytes::from_static(b"fresh"))
+        .await
+        .unwrap();
+
+    // Il nuovo client riceve solo "new/topic": le vecchie sottoscrizioni sono state scartate
+    let received = timeout(Duration::from_secs(2), new_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match received {
+        Packet::Publish { topic, payload, .. } => {
+            assert_eq!(topic, "new/topic");
+            assert_eq!(payload, Bytes::from_static(b"fresh"));
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
 }

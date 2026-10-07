@@ -3,7 +3,10 @@ use bytes::Bytes;
 use crate::QoS::{AtLeastOnce, AtMostOnce, ExactlyOnce};
 
 /// MQTT Quality of Service levels according to OASIS specification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `PartialOrd`/`Ord` sono derivati: l'ordine segue quello di dichiarazione delle
+/// varianti (0 < 1 < 2), quindi `QoS::AtLeastOnce.min(QoS::AtMostOnce)` funziona.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum QoS {
     /// QoS 0: At most once delivery (Fire and forget)
@@ -139,6 +142,17 @@ pub enum SubAckReturnCode {
     Failure = 0x80,
 }
 
+/// Il return code di successo di un SUBACK è il QoS effettivamente concesso.
+impl From<QoS> for SubAckReturnCode {
+    fn from(granted: QoS) -> Self {
+        match granted {
+            QoS::AtMostOnce => SubAckReturnCode::SuccessQoS0,
+            QoS::AtLeastOnce => SubAckReturnCode::SuccessQoS1,
+            QoS::ExactlyOnce => SubAckReturnCode::SuccessQoS2,
+        }
+    }
+}
+
 impl TryFrom<u8> for SubAckReturnCode {
     type Error = ProtocolError;
 
@@ -153,6 +167,16 @@ impl TryFrom<u8> for SubAckReturnCode {
     }
 }
 
+/// Last Will and Testament: messaggio che il broker pubblica a nome del client
+/// se la connessione cade senza un `DISCONNECT` pulito.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Will {
+    pub topic: String,
+    pub payload: Bytes,
+    pub qos: QoS,
+    pub retain: bool,
+}
+
 /// High-level strongly-typed MQTT packets.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -161,6 +185,7 @@ pub enum Packet {
         clean_session: bool,
         keep_alive: u16,
         client_id: String,
+        will: Option<Will>,
         username: Option<String>,
         password: Option<Bytes>,
     },

@@ -52,7 +52,7 @@ impl TopicTrie {
                 current = current
                     .children
                     .entry(token.to_string())
-                    .or_insert_with(TrieNode::default);
+                    .or_default();
             }
 
             // Se siamo all'ultimo livello e non era '#', registriamo la sottoscrizione
@@ -88,6 +88,26 @@ impl TopicTrie {
             && node.children.is_empty()
             && node.plus_child.is_none()
             && node.hash_subscribers.is_empty()
+    }
+
+    /// Rimuove *tutte* le sottoscrizioni di un client, senza conoscere i suoi filtri.
+    ///
+    /// Visita l'intero albero (costo proporzionale alla sua dimensione), quindi va usata
+    /// solo nei casi rari, ad esempio quando un nuovo CONNECT sostituisce una sessione
+    /// esistente. Nel caso normale `unsubscribe` per filtro è molto più economico.
+    pub fn remove_client(&mut self, client_id: &str) {
+        Self::remove_client_recursive(&mut self.root, client_id);
+    }
+
+    fn remove_client_recursive(node: &mut TrieNode, client_id: &str) {
+        node.subscribers.remove(client_id);
+        node.hash_subscribers.remove(client_id);
+        for child in node.children.values_mut() {
+            Self::remove_client_recursive(child, client_id);
+        }
+        if let Some(plus) = node.plus_child.as_deref_mut() {
+            Self::remove_client_recursive(plus, client_id);
+        }
     }
 
     /// Trova tutti i client a cui recapitare un messaggio pubblicato su un topic concreto.
@@ -205,5 +225,22 @@ mod tests {
 
         trie.unsubscribe("home/+", "user");
         assert!(trie.match_topic("home/light").is_empty());
+    }
+
+    #[test]
+    fn test_remove_client_removes_every_subscription() {
+        let mut trie = TopicTrie::new();
+        trie.subscribe("a/b", "gone".into(), QoS::AtMostOnce);
+        trie.subscribe("a/+/c", "gone".into(), QoS::AtLeastOnce);
+        trie.subscribe("x/#", "gone".into(), QoS::AtMostOnce);
+        trie.subscribe("a/b", "stays".into(), QoS::AtMostOnce);
+
+        trie.remove_client("gone");
+
+        let matches = trie.match_topic("a/b");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].client_id, "stays");
+        assert!(trie.match_topic("a/z/c").is_empty());
+        assert!(trie.match_topic("x/y/z").is_empty());
     }
 }

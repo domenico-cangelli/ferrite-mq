@@ -1,5 +1,5 @@
 use crate::error::ProtocolError;
-use crate::packet::{ConnectReturnCode, Packet, PacketType, ProtocolVersion, QoS};
+use crate::packet::{ConnectReturnCode, Packet, PacketType, ProtocolVersion, QoS, Will};
 use crate::varint::{decode_varint, encode_varint};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::str;
@@ -101,9 +101,10 @@ impl Decoder for MqttCodec {
 
                 let client_id = Self::decode_string(&mut body)?;
 
-                // Salta topic e payload del Will se presenti (espandibile nei prossimi step)
-                if has_will {
-                    let _will_topic = Self::decode_string(&mut body)?;
+                // Will: topic + payload nel payload del CONNECT; QoS (bit 3-4) e retain (bit 5)
+                // stanno invece nei connect flags.
+                let will = if has_will {
+                    let will_topic = Self::decode_string(&mut body)?;
                     if body.remaining() < 2 {
                         return Err(ProtocolError::Incomplete);
                     }
@@ -111,8 +112,16 @@ impl Decoder for MqttCodec {
                     if body.remaining() < will_payload_len {
                         return Err(ProtocolError::Incomplete);
                     }
-                    body.advance(will_payload_len);
-                }
+                    let will_payload = body.split_to(will_payload_len).freeze();
+                    Some(Will {
+                        topic: will_topic,
+                        payload: will_payload,
+                        qos: QoS::try_from((connect_flags >> 3) & 0x03)?,
+                        retain: (connect_flags & 0x20) != 0,
+                    })
+                } else {
+                    None
+                };
 
                 let username = if has_username {
                     Some(Self::decode_string(&mut body)?)
@@ -138,6 +147,7 @@ impl Decoder for MqttCodec {
                     clean_session,
                     keep_alive,
                     client_id,
+                    will,
                     username,
                     password,
                 }))
@@ -242,7 +252,15 @@ impl Decoder for MqttCodec {
                 Ok(Some(Packet::PubAck { packet_id }))
             }
 
-            _ => Ok(None),
+            // Pacchetti previsti da MQTT ma non ancora implementati (QoS 2, UNSUBSCRIBE, AUTH).
+            // I loro byte sono già stati consumati dal buffer: restituire `Ok(None)` li
+            // farebbe sparire in silenzio, quindi segnaliamo un errore esplicito.
+            PacketType::PubRec
+            | PacketType::PubRel
+            | PacketType::PubComp
+            | PacketType::Unsubscribe
+            | PacketType::UnsubAck
+            | PacketType::Auth => Err(ProtocolError::InvalidPacketType(packet_type as u8)),
         }
     }
 }
@@ -257,6 +275,7 @@ impl Encoder<Packet> for MqttCodec {
                 clean_session,
                 keep_alive,
                 client_id,
+                will,
                 username,
                 password,
             } => {
@@ -273,6 +292,13 @@ impl Encoder<Packet> for MqttCodec {
                 if clean_session {
                     flags |= 0x02;
                 }
+                if let Some(will) = &will {
+                    flags |= 0x04; // Will Flag
+                    flags |= (will.qos as u8) << 3; // Will QoS (bit 3-4)
+                    if will.retain {
+                        flags |= 0x20; // Will Retain
+                    }
+                }
                 if username.is_some() {
                     flags |= 0x80;
                 }
@@ -286,6 +312,13 @@ impl Encoder<Packet> for MqttCodec {
 
                 // Payload: Client Identifier
                 Self::encode_string(&client_id, &mut body);
+
+                // Payload: Will Topic + Will Payload (nell'ordine imposto dalla spec)
+                if let Some(will) = &will {
+                    Self::encode_string(&will.topic, &mut body);
+                    body.put_u16(will.payload.len() as u16);
+                    body.put_slice(&will.payload);
+                }
 
                 // Payload: Username
                 if let Some(user) = &username {
@@ -419,104 +452,157 @@ impl Encoder<Packet> for MqttCodec {
     }
 }
 
-#[test]
-fn test_connect_and_connack_roundtrip() {
-    let mut codec = MqttCodec::default();
-    let mut buffer = BytesMut::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let connect = Packet::Connect {
-        protocol_version: ProtocolVersion::Mqtt311,
-        clean_session: true,
-        keep_alive: 60,
-        client_id: "ferrite-client-01".to_string(),
-        username: Some("admin".to_string()),
-        password: Some(Bytes::from_static(b"secret")),
-    };
+    #[test]
+    fn test_connect_and_connack_roundtrip() {
+        let mut codec = MqttCodec::default();
+        let mut buffer = BytesMut::new();
 
-    codec.encode(connect.clone(), &mut buffer).unwrap();
-    let decoded = codec.decode(&mut buffer).unwrap();
-    assert_eq!(decoded, Some(connect));
-    assert!(buffer.is_empty());
+        let connect = Packet::Connect {
+            protocol_version: ProtocolVersion::Mqtt311,
+            clean_session: true,
+            keep_alive: 60,
+            client_id: "ferrite-client-01".to_string(),
+            will: None,
+            username: Some("admin".to_string()),
+            password: Some(Bytes::from_static(b"secret")),
+        };
 
-    let connack = Packet::ConnAck {
-        session_present: false,
-        return_code: ConnectReturnCode::Accepted,
-    };
+        codec.encode(connect.clone(), &mut buffer).unwrap();
+        let decoded = codec.decode(&mut buffer).unwrap();
+        assert_eq!(decoded, Some(connect));
+        assert!(buffer.is_empty());
 
-    codec.encode(connack.clone(), &mut buffer).unwrap();
-    let decoded_ack = codec.decode(&mut buffer).unwrap();
-    assert_eq!(decoded_ack, Some(connack));
-    assert!(buffer.is_empty());
-}
+        let connack = Packet::ConnAck {
+            session_present: false,
+            return_code: ConnectReturnCode::Accepted,
+        };
 
-#[test]
-fn test_subscribe_and_suback_roundtrip() {
-    let mut codec = MqttCodec::default();
-    let mut buffer = BytesMut::new();
+        codec.encode(connack.clone(), &mut buffer).unwrap();
+        let decoded_ack = codec.decode(&mut buffer).unwrap();
+        assert_eq!(decoded_ack, Some(connack));
+        assert!(buffer.is_empty());
+    }
 
-    let subscribe = Packet::Subscribe {
-        packet_id: 101,
-        topics: vec![
-            crate::SubscribeTopic {
-                filter: "sensors/+/temperature".to_string(),
+    #[test]
+    fn test_subscribe_and_suback_roundtrip() {
+        let mut codec = MqttCodec::default();
+        let mut buffer = BytesMut::new();
+
+        let subscribe = Packet::Subscribe {
+            packet_id: 101,
+            topics: vec![
+                crate::SubscribeTopic {
+                    filter: "sensors/+/temperature".to_string(),
+                    qos: QoS::AtLeastOnce,
+                },
+                crate::SubscribeTopic {
+                    filter: "alarms/#".to_string(),
+                    qos: QoS::AtMostOnce,
+                },
+            ],
+        };
+
+        codec.encode(subscribe.clone(), &mut buffer).unwrap();
+        let decoded = codec.decode(&mut buffer).unwrap();
+        assert_eq!(decoded, Some(subscribe));
+        assert!(buffer.is_empty());
+
+        let suback = Packet::SubAck {
+            packet_id: 101,
+            return_codes: vec![crate::SubAckReturnCode::SuccessQoS1, crate::SubAckReturnCode::SuccessQoS0],
+        };
+
+        codec.encode(suback.clone(), &mut buffer).unwrap();
+        let decoded_ack = codec.decode(&mut buffer).unwrap();
+        assert_eq!(decoded_ack, Some(suback));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_puback_roundtrip() {
+        let mut codec = MqttCodec::default();
+        let mut buffer = BytesMut::new();
+
+        let original = Packet::PubAck { packet_id: 1054 };
+
+        // Serializzazione
+        codec.encode(original.clone(), &mut buffer).unwrap();
+        // Fixed header (0x40), Remaining Length (0x02), Packet ID (0x04, 0x1E per 1054)
+        assert_eq!(&buffer[..], &[0x40, 0x02, 0x04, 0x1E]);
+
+        // Deserializzazione
+        let decoded = codec.decode(&mut buffer).unwrap();
+        assert_eq!(decoded, Some(original));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_puback_incomplete_buffer() {
+        let mut codec = MqttCodec::default();
+        let mut buffer = BytesMut::new();
+
+        // Inviamo solo header fisso e il primo byte del packet ID (manca 1 byte)
+        buffer.put_slice(&[0x40, 0x02, 0x00]);
+
+        // Il codec non deve andare in errore ma restituire None (attesa dati)
+        let result = codec.decode(&mut buffer).unwrap();
+        assert_eq!(result, None);
+
+        // Aggiungiamo il byte mancante
+        buffer.put_u8(0x2A); // ID: 42
+        let result = codec.decode(&mut buffer).unwrap();
+        assert_eq!(result, Some(Packet::PubAck { packet_id: 42 }));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_connect_with_will_roundtrip() {
+        let mut codec = MqttCodec::default();
+        let mut buffer = BytesMut::new();
+
+        let connect = Packet::Connect {
+            protocol_version: ProtocolVersion::Mqtt311,
+            clean_session: true,
+            keep_alive: 30,
+            client_id: "sensor-7".to_string(),
+            will: Some(Will {
+                topic: "status/sensor-7".to_string(),
+                payload: Bytes::from_static(b"offline"),
                 qos: QoS::AtLeastOnce,
-            },
-            crate::SubscribeTopic {
-                filter: "alarms/#".to_string(),
-                qos: QoS::AtMostOnce,
-            },
-        ],
-    };
+                retain: true,
+            }),
+            username: None,
+            password: None,
+        };
 
-    codec.encode(subscribe.clone(), &mut buffer).unwrap();
-    let decoded = codec.decode(&mut buffer).unwrap();
-    assert_eq!(decoded, Some(subscribe));
-    assert!(buffer.is_empty());
+        codec.encode(connect.clone(), &mut buffer).unwrap();
 
-    let suback = Packet::SubAck {
-        packet_id: 101,
-        return_codes: vec![crate::SubAckReturnCode::SuccessQoS1, crate::SubAckReturnCode::SuccessQoS0],
-    };
+        // Connect flags: clean session (0x02) | will (0x04) | will QoS 1 (0x08) | will retain (0x20)
+        // Layout: header(1) + remaining length(1) + "MQTT"(2+4) + level(1) -> flags al byte 9
+        assert_eq!(buffer[9], 0x02 | 0x04 | 0x08 | 0x20);
 
-    codec.encode(suback.clone(), &mut buffer).unwrap();
-    let decoded_ack = codec.decode(&mut buffer).unwrap();
-    assert_eq!(decoded_ack, Some(suback));
-    assert!(buffer.is_empty());
-}
+        let decoded = codec.decode(&mut buffer).unwrap();
+        assert_eq!(decoded, Some(connect));
+        assert!(buffer.is_empty());
+    }
 
-#[test]
-fn test_puback_roundtrip() {
-    let mut codec = MqttCodec::default();
-    let mut buffer = BytesMut::new();
+    #[test]
+    fn test_unsupported_packet_returns_error_and_consumes_bytes() {
+        let mut codec = MqttCodec::default();
+        let mut buffer = BytesMut::new();
 
-    let original = Packet::PubAck { packet_id: 1054 };
+        // PUBREC (tipo 5) con packet id 1, seguito da un PINGREQ valido
+        buffer.put_slice(&[0x50, 0x02, 0x00, 0x01]);
+        buffer.put_slice(&[0xC0, 0x00]);
 
-    // Serializzazione
-    codec.encode(original.clone(), &mut buffer).unwrap();
-    // Fixed header (0x40), Remaining Length (0x02), Packet ID (0x04, 0x1E per 1054)
-    assert_eq!(&buffer[..], &[0x40, 0x02, 0x04, 0x1E]);
+        let result = codec.decode(&mut buffer);
+        assert!(matches!(result, Err(ProtocolError::InvalidPacketType(5))));
 
-    // Deserializzazione
-    let decoded = codec.decode(&mut buffer).unwrap();
-    assert_eq!(decoded, Some(original));
-    assert!(buffer.is_empty());
-}
-
-#[test]
-fn test_puback_incomplete_buffer() {
-    let mut codec = MqttCodec::default();
-    let mut buffer = BytesMut::new();
-
-    // Inviamo solo header fisso e il primo byte del packet ID (manca 1 byte)
-    buffer.put_slice(&[0x40, 0x02, 0x00]);
-
-    // Il codec non deve andare in errore ma restituire None (attesa dati)
-    let result = codec.decode(&mut buffer).unwrap();
-    assert_eq!(result, None);
-
-    // Aggiungiamo il byte mancante
-    buffer.put_u8(0x2A); // ID: 42
-    let result = codec.decode(&mut buffer).unwrap();
-    assert_eq!(result, Some(Packet::PubAck { packet_id: 42 }));
-    assert!(buffer.is_empty());
+        // Il pacchetto non supportato è stato consumato: il successivo si decodifica normalmente
+        assert_eq!(codec.decode(&mut buffer).unwrap(), Some(Packet::PingReq));
+    }
 }
