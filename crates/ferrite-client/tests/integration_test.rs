@@ -696,3 +696,98 @@ async fn test_connect_protocol_level_5_receives_connack_0x01_and_closes() {
         .expect("Timeout waiting for socket close after CONNACK 0x01");
     assert!(closed.is_none());
 }
+
+#[tokio::test]
+async fn test_two_anonymous_clients_with_clean_session_stay_connected() {
+    let broker_addr = start_test_broker().await;
+
+    // Primo client anonimo (client_id vuoto, clean_session = true) iscritto a "anon/topic"
+    let mut anon1 = raw_connect(broker_addr, "", 60).await;
+    anon1
+        .send(Packet::Subscribe {
+            packet_id: 1,
+            topics: vec![ferrite_protocol::SubscribeTopic {
+                filter: "anon/topic".into(),
+                qos: QoS::AtMostOnce,
+            }],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), anon1.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Packet::SubAck { .. }
+    ));
+
+    // Secondo client anonimo (client_id vuoto, clean_session = true): non deve scalzare il primo
+    let mut anon2 = raw_connect(broker_addr, "", 60).await;
+
+    // Il secondo client pubblica su "anon/topic": il primo deve ancora riceverlo
+    anon2
+        .send(Packet::Publish {
+            topic: "anon/topic".into(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from_static(b"hello-anon"),
+        })
+        .await
+        .unwrap();
+
+    let received = timeout(Duration::from_secs(2), anon1.next())
+        .await
+        .expect("Timeout waiting for PUBLISH on first anonymous client")
+        .expect("First anonymous client was unexpectedly disconnected")
+        .expect("Protocol error");
+    match received {
+        Packet::Publish { topic, payload, .. } => {
+            assert_eq!(topic, "anon/topic");
+            assert_eq!(payload, Bytes::from_static(b"hello-anon"));
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_empty_client_id_with_clean_session_false_returns_connack_0x02_and_closes() {
+    let broker_addr = start_test_broker().await;
+
+    let stream = tokio::net::TcpStream::connect(broker_addr).await.unwrap();
+    let mut framed = Framed::new(stream, MqttCodec::default());
+
+    framed
+        .send(Packet::Connect {
+            protocol_version: ProtocolVersion::Mqtt311,
+            clean_session: false,
+            keep_alive: 60,
+            client_id: String::new(),
+            will: None,
+            username: None,
+            password: None,
+        })
+        .await
+        .unwrap();
+
+    let response = timeout(Duration::from_secs(2), framed.next())
+        .await
+        .expect("Timeout waiting for CONNACK 0x02")
+        .expect("Connection closed before CONNACK")
+        .expect("Protocol error");
+
+    assert_eq!(
+        response,
+        Packet::ConnAck {
+            session_present: false,
+            return_code: ferrite_protocol::ConnectReturnCode::RefusedIdentifierRejected,
+        }
+    );
+
+    let closed = timeout(Duration::from_secs(2), framed.next())
+        .await
+        .expect("Timeout waiting for socket close after CONNACK 0x02");
+    assert!(closed.is_none());
+}
