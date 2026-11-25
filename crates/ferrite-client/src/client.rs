@@ -30,6 +30,11 @@ pub enum ClientCommand {
         filter: String,
         qos: QoS,
     },
+    Unsubscribe {
+        packet_id: u16,
+        filter: String,
+        ack_sender: oneshot::Sender<()>,
+    },
     Disconnect,
 }
 
@@ -113,6 +118,26 @@ impl AsyncClient {
             })
             .await
             .map_err(|_| ClientError::ChannelClosed)?;
+
+        Ok(())
+    }
+
+    /// Annulla la sottoscrizione a un topic filter e attende il relativo UNSUBACK dal broker
+    pub async fn unsubscribe<T: Into<String>>(&self, filter: T) -> Result<(), ClientError> {
+        let packet_id = self.next_packet_id();
+        let (ack_tx, ack_rx) = oneshot::channel();
+
+        self.command_tx
+            .send(ClientCommand::Unsubscribe {
+                packet_id,
+                filter: filter.into(),
+                ack_sender: ack_tx,
+            })
+            .await
+            .map_err(|_| ClientError::ChannelClosed)?;
+
+        // Attende che il Connection Driver riceva l'UNSUBACK corrispondente
+        ack_rx.await.map_err(|_| ClientError::AckChannelDropped)?;
 
         Ok(())
     }
@@ -201,6 +226,8 @@ pub async fn connect(
     tokio::spawn(async move {
         // Mappa dei pacchetti QoS 1 in volo in attesa di PUBACK
         let mut pending_acks: HashMap<u16, oneshot::Sender<()>> = HashMap::new();
+        // Mappa delle richieste UNSUBSCRIBE in volo in attesa di UNSUBACK
+        let mut pending_unsubacks: HashMap<u16, oneshot::Sender<()>> = HashMap::new();
 
         loop {
             tokio::select! {
@@ -249,6 +276,20 @@ pub async fn connect(
                                 break;
                             }
                         }
+                        ClientCommand::Unsubscribe {
+                            packet_id,
+                            filter,
+                            ack_sender,
+                        } => {
+                            pending_unsubacks.insert(packet_id, ack_sender);
+                            let packet = Packet::Unsubscribe {
+                                packet_id,
+                                filters: vec![filter],
+                            };
+                            if framed.send(packet).await.is_err() {
+                                break;
+                            }
+                        }
                         ClientCommand::Disconnect => {
                             let _ = framed.send(Packet::Disconnect).await;
                             break;
@@ -261,6 +302,12 @@ pub async fn connect(
                         Ok(Packet::PubAck { packet_id }) => {
                             // Se un oneshot::Sender è registrato per questo ID, inviamo la notifica
                             if let Some(ack_tx) = pending_acks.remove(&packet_id) {
+                                let _ = ack_tx.send(());
+                            }
+                        }
+                        Ok(Packet::UnsubAck { packet_id }) => {
+                            // Risolviamo il oneshot senza inoltrare UNSUBACK al canale incoming
+                            if let Some(ack_tx) = pending_unsubacks.remove(&packet_id) {
                                 let _ = ack_tx.send(());
                             }
                         }

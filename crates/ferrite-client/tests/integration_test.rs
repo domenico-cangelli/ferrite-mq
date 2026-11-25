@@ -1087,3 +1087,168 @@ async fn test_takeover_stress_leaves_no_orphan_subscriptions() {
     pub_client.disconnect().await.unwrap();
     final_dup.disconnect().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_broker_unsubscribe_removes_only_requested_filter() {
+    let broker_addr = start_test_broker().await;
+
+    let mut sub = raw_connect(broker_addr, "sub-unsub", 60).await;
+    sub.send(Packet::Subscribe {
+        packet_id: 1,
+        topics: vec![
+            ferrite_protocol::SubscribeTopic {
+                filter: "a/b".into(),
+                qos: QoS::AtMostOnce,
+            },
+            ferrite_protocol::SubscribeTopic {
+                filter: "c/d".into(),
+                qos: QoS::AtMostOnce,
+            },
+        ],
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), sub.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Packet::SubAck { packet_id: 1, .. }
+    ));
+
+    // UNSUBSCRIBE solo da "a/b"
+    sub.send(Packet::Unsubscribe {
+        packet_id: 42,
+        filters: vec!["a/b".into()],
+    })
+    .await
+    .unwrap();
+    let unsuback = timeout(Duration::from_secs(2), sub.next())
+        .await
+        .expect("Timeout waiting for UNSUBACK")
+        .expect("Connection closed")
+        .expect("Protocol error");
+    assert_eq!(unsuback, Packet::UnsubAck { packet_id: 42 });
+
+    let (pub_client, _pub_rx) = connect(MqttOptions::new("pub-unsub", broker_addr))
+        .await
+        .unwrap();
+    pub_client
+        .publish("a/b", Bytes::from_static(b"dropped"))
+        .await
+        .unwrap();
+    pub_client
+        .publish("c/d", Bytes::from_static(b"delivered"))
+        .await
+        .unwrap();
+
+    // Deve arrivare solo "c/d", non "a/b".
+    let received = timeout(Duration::from_secs(2), sub.next())
+        .await
+        .expect("Timeout waiting for PUBLISH on c/d")
+        .expect("Connection closed")
+        .expect("Protocol error");
+    match received {
+        Packet::Publish { topic, payload, .. } => {
+            assert_eq!(topic, "c/d");
+            assert_eq!(payload, Bytes::from_static(b"delivered"));
+        }
+        other => panic!("Expected Publish on c/d, got {:?}", other),
+    }
+
+    pub_client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_broker_unsubscribe_unknown_filter_returns_unsuback_and_stays_open() {
+    let broker_addr = start_test_broker().await;
+
+    let mut sub = raw_connect(broker_addr, "sub-unsub-unknown", 60).await;
+
+    // UNSUBSCRIBE di un filtro mai sottoscritto: MQTT-3.10.4-5 richiede UNSUBACK ugualmente.
+    sub.send(Packet::Unsubscribe {
+        packet_id: 99,
+        filters: vec!["never/subscribed".into()],
+    })
+    .await
+    .unwrap();
+    let unsuback = timeout(Duration::from_secs(2), sub.next())
+        .await
+        .expect("Timeout waiting for UNSUBACK")
+        .expect("Connection closed")
+        .expect("Protocol error");
+    assert_eq!(unsuback, Packet::UnsubAck { packet_id: 99 });
+
+    // La connessione deve restare aperta (verifichiamo con PINGREQ -> PINGRESP).
+    sub.send(Packet::PingReq).await.unwrap();
+    let pingresp = timeout(Duration::from_secs(2), sub.next())
+        .await
+        .expect("Timeout waiting for PINGRESP")
+        .expect("Connection closed after UNSUBSCRIBE of unknown filter")
+        .expect("Protocol error");
+    assert_eq!(pingresp, Packet::PingResp);
+}
+
+#[tokio::test]
+async fn test_client_unsubscribe_waits_for_unsuback_and_stops_receiving() {
+    let broker_addr = start_test_broker().await;
+
+    let (sub_client, mut sub_rx) = connect(MqttOptions::new("client-unsub", broker_addr))
+        .await
+        .unwrap();
+    sub_client
+        .subscribe("updates/news", QoS::AtMostOnce)
+        .await
+        .unwrap();
+    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(suback, Packet::SubAck { .. }));
+
+    let (pub_client, _pub_rx) = connect(MqttOptions::new("pub-news", broker_addr))
+        .await
+        .unwrap();
+
+    // 1. Prima dell'unsubscribe il messaggio arriva normalmente
+    pub_client
+        .publish("updates/news", Bytes::from_static(b"msg-1"))
+        .await
+        .unwrap();
+    let first = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .expect("Timeout waiting for first PUBLISH")
+        .expect("Channel closed");
+    match first {
+        Packet::Publish { topic, payload, .. } => {
+            assert_eq!(topic, "updates/news");
+            assert_eq!(payload, Bytes::from_static(b"msg-1"));
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
+
+    // 2. Unsubscribe attende UNSUBACK (che non viene inoltrato a sub_rx)
+    timeout(
+        Duration::from_secs(2),
+        sub_client.unsubscribe("updates/news"),
+    )
+    .await
+    .expect("Timeout waiting for unsubscribe UNSUBACK")
+    .expect("unsubscribe failed");
+
+    // 3. Dopo l'unsubscribe nessun messaggio (e nessun UNSUBACK) deve arrivare su sub_rx
+    pub_client
+        .publish("updates/news", Bytes::from_static(b"msg-2"))
+        .await
+        .unwrap();
+    let nothing = timeout(Duration::from_millis(300), sub_rx.recv()).await;
+    assert!(
+        nothing.is_err(),
+        "ricevuto pacchetto inatteso dopo unsubscribe: {:?}",
+        nothing
+    );
+
+    pub_client.disconnect().await.unwrap();
+    sub_client.disconnect().await.unwrap();
+}
