@@ -186,3 +186,46 @@ Attualmente il broker recapita i messaggi ai subscriber con `packet_id: None` (c
 | `encode_string` tronca con `as u16` le stringhe più lunghe di 65535 byte invece di restituire un errore. | `protocol/codec.rs` | Prima di aprire il progetto al pubblico |
 | Il `Will` ricevuto nel `CONNECT` è decodificato ma il broker lo ignora. | `broker-core/server.rs` | Fase 4 |
 | Il broker non gestisce `UNSUBSCRIBE`: il trie ha `unsubscribe`, ma non è raggiungibile dalla rete. | `protocol`, `broker-core` | Prima della Fase 3 |
+
+
+---
+
+## 5. Piano di lavoro (revisione del 2026-11-25)
+
+Il tracciamento è su GitHub Issues e Milestones: https://github.com/domenico-cangelli/ferrite-mq/issues
+Ramo di integrazione: `develop`. Ogni correzione ha un ramo `fix/<issue>-<nome>`, una PR con `Closes #N` e almeno un test.
+
+Correzioni alla sezione 4: il deadlock (#3) è più grave di come descritto (un solo client può bloccarsi da solo e congelare il broker, perché il lock di tokio è write-fair). La race del takeover (#12) non è stretta: la perdita è permanente. `encode_string` (#10) tronca anche payload del Will e password. Il filtro di log predefinito nasconde i log di `ferrite_broker_core` (#11).
+
+Ordine di esecuzione (priorità e dipendenze):
+
+| Ordine | Issue | Milestone | Dipende da |
+| :--- | :--- | :--- | :--- |
+| 1 | #2 fmt e warning clippy | M0 Qualità e CI | - |
+| 2 | #1 CI GitHub Actions | M0 | #2 |
+| 3 | #3 deadlock back-pressure | M1 Robustezza broker | #1 |
+| 4 | #4 trie: limiti, validazione, potatura | M1 | #1 |
+| 5 | #5 SUBSCRIBE/PUBLISH validati | M1 | #4 |
+| 6 | #12 race takeover | M1 | #3 |
+| 7 | #11 limiti memoria e config | M1 | #1 |
+| 8 | #6 CONNECT conforme | M2 Conformità | #1 |
+| 9 | #7 RETAIN/DUP nell'inoltro | M2 | #1 |
+| 10 | #9 UNSUBSCRIBE end-to-end | M2 | #4 |
+| 11 | #10 codec validazione rigorosa | M2 | #1 |
+| 12 | #8 QoS 2 rifiutato in modo pulito | M2 | #1 |
+| 13 | #13 client: PINGRESP e canale incoming | M3 Client robusto | #1 |
+| 14 | #14 client: chiusura, timeout, SUBACK | M3 | #13 |
+| 15 | #15 Fase 2: QoS 1 verso subscriber | M4 | #3, #13 |
+| 16 | #16 Fase 3: sessioni persistenti | M5 | #12, #15 |
+| 17 | #17 Fase 4: retained e Will | M6 | #16 |
+| 18 | #18 Fase 5: QoS 2 | M7 | #15, #8 |
+| 19 | #19 Fase 6: TLS, auth, ACL | M8 | #6 |
+| 20 | #20 Fase 7: benchmark e scalabilità | M9 | #15 |
+| 21 | #21 ferrite-cli | M10 | #14 |
+| 22 | #22 documentazione | M0 | - |
+| 23 | #23 conformità e fuzzing | M10 | #10 |
+| 24 | #24 idee oltre Paho e Mosquitto | M10 | - |
+
+Idee per superare i limiti di Paho e Mosquitto: vedi #24 (broker multi-thread, client async con backpressure, MQTT 5, metriche, persistenza su disco, cluster).
+
+I passi piccoli (file, risultato atteso, comando di verifica) sono nel corpo di ogni issue.
