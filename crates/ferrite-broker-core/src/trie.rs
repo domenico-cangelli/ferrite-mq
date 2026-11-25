@@ -1,5 +1,84 @@
 use ferrite_protocol::QoS;
 use std::collections::HashMap;
+use std::fmt;
+use tracing::warn;
+
+const MAX_FILTER_BYTES: usize = 65535;
+const MAX_FILTER_LEVELS: usize = 64;
+
+/// Errore di validazione di un MQTT Topic Filter (MQTT-4.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilterError {
+    Empty,
+    TooLong,
+    TooDeep,
+    InvalidHash,
+    InvalidPlus,
+    NulChar,
+}
+
+impl fmt::Display for FilterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FilterError::Empty => write!(f, "topic filter cannot be empty"),
+            FilterError::TooLong => {
+                write!(
+                    f,
+                    "topic filter exceeds maximum length of {MAX_FILTER_BYTES} bytes"
+                )
+            }
+            FilterError::TooDeep => {
+                write!(
+                    f,
+                    "topic filter exceeds maximum depth of {MAX_FILTER_LEVELS} levels"
+                )
+            }
+            FilterError::InvalidHash => {
+                write!(
+                    f,
+                    "'#' wildcard must occupy an entire level and be the last level"
+                )
+            }
+            FilterError::InvalidPlus => {
+                write!(f, "'+' wildcard must occupy an entire level")
+            }
+            FilterError::NulChar => write!(f, "topic filter cannot contain NUL (U+0000)"),
+        }
+    }
+}
+
+impl std::error::Error for FilterError {}
+
+/// Valida un MQTT Topic Filter secondo le regole MQTT 3.1.1 (sezione 4.7) e i limiti del broker.
+pub fn validate_filter(filter: &str) -> Result<(), FilterError> {
+    if filter.is_empty() {
+        return Err(FilterError::Empty);
+    }
+
+    let mut levels = 0usize;
+    let mut iter = filter.split('/').peekable();
+    while let Some(token) = iter.next() {
+        levels += 1;
+        if levels > MAX_FILTER_LEVELS {
+            return Err(FilterError::TooDeep);
+        }
+        if token.contains('\0') {
+            return Err(FilterError::NulChar);
+        }
+        if token.contains('#') && (token != "#" || iter.peek().is_some()) {
+            return Err(FilterError::InvalidHash);
+        }
+        if token.contains('+') && token != "+" {
+            return Err(FilterError::InvalidPlus);
+        }
+    }
+
+    if filter.len() > MAX_FILTER_BYTES {
+        return Err(FilterError::TooLong);
+    }
+
+    Ok(())
+}
 
 /// Rappresenta una sottoscrizione effettuata da un client a un topic filter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -21,6 +100,27 @@ pub struct TrieNode {
     hash_subscribers: HashMap<String, QoS>,
 }
 
+impl TrieNode {
+    fn is_empty(&self) -> bool {
+        self.subscribers.is_empty()
+            && self.children.is_empty()
+            && self.plus_child.is_none()
+            && self.hash_subscribers.is_empty()
+    }
+
+    #[cfg(test)]
+    fn node_count(&self) -> usize {
+        let mut count = 1;
+        for child in self.children.values() {
+            count += child.node_count();
+        }
+        if let Some(plus) = self.plus_child.as_deref() {
+            count += plus.node_count();
+        }
+        count
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct TopicTrie {
     root: TrieNode,
@@ -33,8 +133,15 @@ impl TopicTrie {
         }
     }
 
-    /// Inserisce un filtro di sottoscrizione (es. "sensors/+/temperature") per un dato client.
-    pub fn subscribe(&mut self, topic_filter: &str, client_id: String, qos: QoS) {
+    /// Inserisce un filtro di sottoscrizione validato nel trie.
+    pub fn try_subscribe(
+        &mut self,
+        topic_filter: &str,
+        client_id: String,
+        qos: QoS,
+    ) -> Result<(), FilterError> {
+        validate_filter(topic_filter)?;
+
         let tokens: Vec<&str> = topic_filter.split('/').collect();
         let mut current = &mut self.root;
 
@@ -42,7 +149,7 @@ impl TopicTrie {
             if token == "#" {
                 // '#' deve essere l'ultimo carattere del filtro
                 current.hash_subscribers.insert(client_id, qos);
-                return;
+                return Ok(());
             } else if token == "+" {
                 if current.plus_child.is_none() {
                     current.plus_child = Some(Box::new(TrieNode::default()));
@@ -57,6 +164,16 @@ impl TopicTrie {
                 current.subscribers.insert(client_id.clone(), qos);
             }
         }
+
+        Ok(())
+    }
+
+    /// Inserisce un filtro di sottoscrizione (es. "sensors/+/temperature") per un dato client.
+    /// Se il filtro è invalido non inserisce nulla e registra un `warn!`.
+    pub fn subscribe(&mut self, topic_filter: &str, client_id: String, qos: QoS) {
+        if let Err(err) = self.try_subscribe(topic_filter, client_id, qos) {
+            warn!("Ignoring invalid topic filter {:?}: {}", topic_filter, err);
+        }
     }
     /// Rimuove la sottoscrizione di un client a uno specifico topic filter.
     pub fn unsubscribe(&mut self, topic_filter: &str, client_id: &str) {
@@ -70,21 +187,23 @@ impl TopicTrie {
             if token == "#" {
                 node.hash_subscribers.remove(client_id);
             } else if token == "+" {
-                if let Some(plus) = node.plus_child.as_deref_mut() {
-                    Self::remove_recursive(plus, tokens, idx + 1, client_id);
+                let prune_plus = node
+                    .plus_child
+                    .as_deref_mut()
+                    .is_some_and(|plus| Self::remove_recursive(plus, tokens, idx + 1, client_id));
+                if prune_plus {
+                    node.plus_child = None;
                 }
             } else if let Some(child) = node.children.get_mut(token) {
-                Self::remove_recursive(child, tokens, idx + 1, client_id);
+                if Self::remove_recursive(child, tokens, idx + 1, client_id) {
+                    node.children.remove(token);
+                }
             }
         } else {
             node.subscribers.remove(client_id);
         }
 
-        // Cleanup: i rami vuoti possono essere potati (ottimizzazione futura)
-        node.subscribers.is_empty()
-            && node.children.is_empty()
-            && node.plus_child.is_none()
-            && node.hash_subscribers.is_empty()
+        node.is_empty()
     }
 
     /// Rimuove *tutte* le sottoscrizioni di un client, senza conoscere i suoi filtri.
@@ -96,15 +215,22 @@ impl TopicTrie {
         Self::remove_client_recursive(&mut self.root, client_id);
     }
 
-    fn remove_client_recursive(node: &mut TrieNode, client_id: &str) {
+    fn remove_client_recursive(node: &mut TrieNode, client_id: &str) -> bool {
         node.subscribers.remove(client_id);
         node.hash_subscribers.remove(client_id);
-        for child in node.children.values_mut() {
-            Self::remove_client_recursive(child, client_id);
-        }
+        node.children
+            .retain(|_, child| !Self::remove_client_recursive(child, client_id));
         if let Some(plus) = node.plus_child.as_deref_mut() {
-            Self::remove_client_recursive(plus, client_id);
+            if Self::remove_client_recursive(plus, client_id) {
+                node.plus_child = None;
+            }
         }
+        node.is_empty()
+    }
+
+    #[cfg(test)]
+    fn node_count(&self) -> usize {
+        self.root.node_count()
     }
 
     /// Trova tutti i client a cui recapitare un messaggio pubblicato su un topic concreto.
@@ -131,16 +257,21 @@ impl TopicTrie {
         idx: usize,
         results: &mut HashMap<String, QoS>,
     ) {
+        // MQTT-4.7.2-1: un topic che inizia con '$' non deve matchare i wildcard '#' o '+' in radice.
+        let skip_root_wildcards = idx == 0 && tokens.first().is_some_and(|t| t.starts_with('$'));
+
         // 1. Chiunque sia sottoscritto con '#' a questo livello matcha tutto ciò che segue
-        for (client_id, &qos) in &node.hash_subscribers {
-            results
-                .entry(client_id.clone())
-                .and_modify(|existing_qos| {
-                    if qos as u8 > *existing_qos as u8 {
-                        *existing_qos = qos;
-                    }
-                })
-                .or_insert(qos);
+        if !skip_root_wildcards {
+            for (client_id, &qos) in &node.hash_subscribers {
+                results
+                    .entry(client_id.clone())
+                    .and_modify(|existing_qos| {
+                        if qos as u8 > *existing_qos as u8 {
+                            *existing_qos = qos;
+                        }
+                    })
+                    .or_insert(qos);
+            }
         }
 
         // 2. Se abbiamo esaminato tutti i token del topic concreto
@@ -166,8 +297,10 @@ impl TopicTrie {
         }
 
         // 4. Match tramite wildcard '+'
-        if let Some(plus) = node.plus_child.as_deref() {
-            Self::match_recursive(plus, tokens, idx + 1, results);
+        if !skip_root_wildcards {
+            if let Some(plus) = node.plus_child.as_deref() {
+                Self::match_recursive(plus, tokens, idx + 1, results);
+            }
         }
     }
 }
@@ -239,5 +372,147 @@ mod tests {
         assert_eq!(matches[0].client_id, "stays");
         assert!(trie.match_topic("a/z/c").is_empty());
         assert!(trie.match_topic("x/y/z").is_empty());
+    }
+
+    #[test]
+    fn test_validate_filter_valid_cases() {
+        for filter in ["#", "+", "a/b", "a/+/c", "a/#", "/a", "a/", "+/+"] {
+            assert_eq!(
+                validate_filter(filter),
+                Ok(()),
+                "filtro valido rifiutato: {filter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_filter_error_variants() {
+        assert_eq!(validate_filter(""), Err(FilterError::Empty));
+        assert_eq!(
+            validate_filter(&"a".repeat(MAX_FILTER_BYTES + 1)),
+            Err(FilterError::TooLong)
+        );
+        assert_eq!(
+            validate_filter(&vec!["a"; MAX_FILTER_LEVELS + 1].join("/")),
+            Err(FilterError::TooDeep)
+        );
+        assert_eq!(validate_filter("a/#/b"), Err(FilterError::InvalidHash));
+        assert_eq!(validate_filter("a#"), Err(FilterError::InvalidHash));
+        assert_eq!(validate_filter("#a"), Err(FilterError::InvalidHash));
+        assert_eq!(validate_filter("a+"), Err(FilterError::InvalidPlus));
+        assert_eq!(validate_filter("+a"), Err(FilterError::InvalidPlus));
+        assert_eq!(validate_filter("a/\0/b"), Err(FilterError::NulChar));
+    }
+
+    #[test]
+    fn test_depth_limit_64_valid_and_100000_rejected() {
+        let mut trie = TopicTrie::new();
+
+        // 64 livelli: valido, inseribile, matchabile e rimovibile senza crash.
+        let max_valid = vec!["a"; MAX_FILTER_LEVELS].join("/");
+        assert_eq!(
+            trie.try_subscribe(&max_valid, "c1".into(), QoS::AtMostOnce),
+            Ok(())
+        );
+        assert_eq!(trie.match_topic(&max_valid).len(), 1);
+        trie.unsubscribe(&max_valid, "c1");
+        assert!(trie.match_topic(&max_valid).is_empty());
+
+        // 100000 livelli: rifiutato subito con TooDeep senza crash.
+        let deep = "a/".repeat(100_000);
+        assert_eq!(
+            trie.try_subscribe(&deep, "c2".into(), QoS::AtMostOnce),
+            Err(FilterError::TooDeep)
+        );
+    }
+
+    #[test]
+    fn test_unsubscribe_prunes_empty_nodes() {
+        let mut trie = TopicTrie::new();
+        assert_eq!(trie.node_count(), 1);
+
+        let filters: Vec<String> = (0..1000)
+            .map(|i| match i % 3 {
+                0 => format!("devices/dev-{i}/status"),
+                1 => format!("sensors/{i}/+/temp"),
+                _ => format!("logs/{i}/#"),
+            })
+            .collect();
+
+        for filter in &filters {
+            trie.subscribe(filter, "client1".into(), QoS::AtMostOnce);
+        }
+        assert!(trie.node_count() > 1000);
+
+        for filter in &filters {
+            trie.unsubscribe(filter, "client1");
+        }
+        assert_eq!(trie.node_count(), 1);
+    }
+
+    #[test]
+    fn test_remove_client_prunes_empty_nodes() {
+        let mut trie = TopicTrie::new();
+        assert_eq!(trie.node_count(), 1);
+
+        for i in 0..1000 {
+            let filter = match i % 3 {
+                0 => format!("devices/dev-{i}/status"),
+                1 => format!("sensors/{i}/+/temp"),
+                _ => format!("logs/{i}/#"),
+            };
+            trie.subscribe(&filter, "client1".into(), QoS::AtMostOnce);
+        }
+        assert!(trie.node_count() > 1000);
+
+        trie.remove_client("client1");
+        assert_eq!(trie.node_count(), 1);
+    }
+
+    #[test]
+    fn test_dollar_topics_do_not_match_root_wildcards() {
+        let mut trie = TopicTrie::new();
+        trie.subscribe("#", "root_hash".into(), QoS::AtMostOnce);
+        trie.subscribe("+/x", "root_plus".into(), QoS::AtMostOnce);
+        trie.subscribe("$SYS/#", "sys_hash".into(), QoS::AtMostOnce);
+        trie.subscribe("$SYS/+", "sys_plus".into(), QoS::AtMostOnce);
+
+        // MQTT-4.7.2-1: '#' e '+/x' non ricevono '$SYS/x'; '$SYS/#' e '$SYS/+' sì.
+        let mut matches_x: Vec<String> = trie
+            .match_topic("$SYS/x")
+            .into_iter()
+            .map(|s| s.client_id)
+            .collect();
+        matches_x.sort();
+        assert_eq!(matches_x, vec!["sys_hash", "sys_plus"]);
+
+        // '$SYS/broker/load' matcha solo '$SYS/#' (non '#' in radice, non '$SYS/+').
+        let matches_load: Vec<String> = trie
+            .match_topic("$SYS/broker/load")
+            .into_iter()
+            .map(|s| s.client_id)
+            .collect();
+        assert_eq!(matches_load, vec!["sys_hash"]);
+
+        // Un topic normale matcha comunque '#' e '+/x'.
+        let mut matches_normal: Vec<String> = trie
+            .match_topic("normal/x")
+            .into_iter()
+            .map(|s| s.client_id)
+            .collect();
+        matches_normal.sort();
+        assert_eq!(matches_normal, vec!["root_hash", "root_plus"]);
+    }
+
+    #[test]
+    fn test_wildcard_hash_matches_parent_level() {
+        // MQTT-4.7.1-2: 'a/#' include anche il livello padre 'a'.
+        let mut trie = TopicTrie::new();
+        trie.subscribe("a/#", "sub".into(), QoS::AtMostOnce);
+
+        assert_eq!(trie.match_topic("a").len(), 1);
+        assert_eq!(trie.match_topic("a/").len(), 1);
+        assert_eq!(trie.match_topic("a/b").len(), 1);
+        assert!(trie.match_topic("ab").is_empty());
     }
 }

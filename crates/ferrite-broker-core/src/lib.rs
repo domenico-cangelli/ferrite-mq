@@ -2,4 +2,4 @@ pub mod server;
 pub mod trie;
 
 pub use server::{run_server, BrokerState};
-pub use trie::{Subscription, TopicTrie};
+pub use trie::{validate_filter, FilterError, Subscription, TopicTrie};
