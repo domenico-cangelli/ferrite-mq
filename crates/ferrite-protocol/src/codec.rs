@@ -27,15 +27,22 @@ impl MqttCodec {
 
     fn decode_string(buf: &mut BytesMut) -> Result<String, ProtocolError> {
         if buf.remaining() < 2 {
-            return Err(ProtocolError::Incomplete);
+            return Err(ProtocolError::MalformedPacket("truncated string length"));
         }
         let str_len = buf.get_u16() as usize;
         if buf.remaining() < str_len {
-            return Err(ProtocolError::Incomplete);
+            return Err(ProtocolError::MalformedPacket("truncated string"));
         }
         let str_bytes = buf.split_to(str_len);
         let s = str::from_utf8(&str_bytes).map_err(|_| ProtocolError::InvalidUtf8)?;
         Ok(s.to_string())
+    }
+
+    fn ensure_empty(body: &BytesMut) -> Result<(), ProtocolError> {
+        if body.has_remaining() {
+            return Err(ProtocolError::MalformedPacket("trailing bytes"));
+        }
+        Ok(())
     }
 
     fn encode_string(src: &str, dst: &mut BytesMut) {
@@ -118,7 +125,7 @@ impl Decoder for MqttCodec {
                 }
 
                 if body.remaining() < 1 {
-                    return Err(ProtocolError::Incomplete);
+                    return Err(ProtocolError::MalformedPacket("truncated connect header"));
                 }
 
                 let version_byte = body.get_u8();
@@ -128,7 +135,7 @@ impl Decoder for MqttCodec {
                 let protocol_version = ProtocolVersion::Mqtt311;
 
                 if body.remaining() < 3 {
-                    return Err(ProtocolError::Incomplete);
+                    return Err(ProtocolError::MalformedPacket("truncated connect header"));
                 }
 
                 let connect_flags = body.get_u8();
@@ -146,11 +153,11 @@ impl Decoder for MqttCodec {
                 let will = if has_will {
                     let will_topic = Self::decode_string(&mut body)?;
                     if body.remaining() < 2 {
-                        return Err(ProtocolError::Incomplete);
+                        return Err(ProtocolError::MalformedPacket("truncated will payload"));
                     }
                     let will_payload_len = body.get_u16() as usize;
                     if body.remaining() < will_payload_len {
-                        return Err(ProtocolError::Incomplete);
+                        return Err(ProtocolError::MalformedPacket("truncated will payload"));
                     }
                     let will_payload = body.split_to(will_payload_len).freeze();
                     Some(Will {
@@ -171,16 +178,18 @@ impl Decoder for MqttCodec {
 
                 let password = if has_password {
                     if body.remaining() < 2 {
-                        return Err(ProtocolError::Incomplete);
+                        return Err(ProtocolError::MalformedPacket("truncated password"));
                     }
                     let pwd_len = body.get_u16() as usize;
                     if body.remaining() < pwd_len {
-                        return Err(ProtocolError::Incomplete);
+                        return Err(ProtocolError::MalformedPacket("truncated password"));
                     }
                     Some(body.split_to(pwd_len).freeze())
                 } else {
                     None
                 };
+
+                Self::ensure_empty(&body)?;
 
                 Ok(Some(Packet::Connect {
                     protocol_version,
@@ -195,11 +204,12 @@ impl Decoder for MqttCodec {
 
             PacketType::ConnAck => {
                 if body.remaining() < 2 {
-                    return Err(ProtocolError::Incomplete);
+                    return Err(ProtocolError::MalformedPacket("truncated connack"));
                 }
                 let flags = body.get_u8();
                 let session_present = (flags & 0x01) != 0;
                 let return_code = ConnectReturnCode::try_from(body.get_u8())?;
+                Self::ensure_empty(&body)?;
 
                 Ok(Some(Packet::ConnAck {
                     session_present,
@@ -207,9 +217,18 @@ impl Decoder for MqttCodec {
                 }))
             }
 
-            PacketType::PingReq => Ok(Some(Packet::PingReq)),
-            PacketType::PingResp => Ok(Some(Packet::PingResp)),
-            PacketType::Disconnect => Ok(Some(Packet::Disconnect)),
+            PacketType::PingReq => {
+                Self::ensure_empty(&body)?;
+                Ok(Some(Packet::PingReq))
+            }
+            PacketType::PingResp => {
+                Self::ensure_empty(&body)?;
+                Ok(Some(Packet::PingResp))
+            }
+            PacketType::Disconnect => {
+                Self::ensure_empty(&body)?;
+                Ok(Some(Packet::Disconnect))
+            }
 
             PacketType::Publish => {
                 let dup = (flags & 0x08) != 0;
@@ -229,7 +248,7 @@ impl Decoder for MqttCodec {
 
                 let packet_id = if qos != QoS::AtMostOnce {
                     if body.remaining() < 2 {
-                        return Err(ProtocolError::Incomplete);
+                        return Err(ProtocolError::MalformedPacket("truncated packet id"));
                     }
                     let id = body.get_u16();
                     if id == 0 {
@@ -255,7 +274,7 @@ impl Decoder for MqttCodec {
             PacketType::Subscribe => {
                 // Il variable header di SUBSCRIBE ha obbligatoriamente il Packet ID (2 byte)
                 if body.remaining() < 2 {
-                    return Err(ProtocolError::Incomplete);
+                    return Err(ProtocolError::MalformedPacket("truncated packet id"));
                 }
                 let packet_id = body.get_u16();
                 if packet_id == 0 {
@@ -267,7 +286,7 @@ impl Decoder for MqttCodec {
                 while body.has_remaining() {
                     let filter = Self::decode_string(&mut body)?;
                     if body.remaining() < 1 {
-                        return Err(ProtocolError::Incomplete);
+                        return Err(ProtocolError::MalformedPacket("truncated subscribe qos"));
                     }
                     let qos_byte = body.get_u8();
                     let qos = QoS::try_from(qos_byte)?;
@@ -276,15 +295,17 @@ impl Decoder for MqttCodec {
 
                 if topics.is_empty() {
                     // La specifica MQTT vieta un pacchetto SUBSCRIBE con payload vuoto
-                    return Err(ProtocolError::Incomplete);
+                    return Err(ProtocolError::MalformedPacket("empty subscribe payload"));
                 }
+
+                Self::ensure_empty(&body)?;
 
                 Ok(Some(Packet::Subscribe { packet_id, topics }))
             }
 
             PacketType::SubAck => {
                 if body.remaining() < 2 {
-                    return Err(ProtocolError::Incomplete);
+                    return Err(ProtocolError::MalformedPacket("truncated packet id"));
                 }
                 let packet_id = body.get_u16();
                 if packet_id == 0 {
@@ -297,6 +318,8 @@ impl Decoder for MqttCodec {
                     return_codes.push(code);
                 }
 
+                Self::ensure_empty(&body)?;
+
                 Ok(Some(Packet::SubAck {
                     packet_id,
                     return_codes,
@@ -306,18 +329,19 @@ impl Decoder for MqttCodec {
             PacketType::PubAck => {
                 // PUBACK deve contenere esattamente il packet_id a 2 byte
                 if body.remaining() < 2 {
-                    return Err(ProtocolError::Incomplete);
+                    return Err(ProtocolError::MalformedPacket("truncated packet id"));
                 }
                 let packet_id = body.get_u16();
                 if packet_id == 0 {
                     return Err(ProtocolError::InvalidPacketId);
                 }
+                Self::ensure_empty(&body)?;
                 Ok(Some(Packet::PubAck { packet_id }))
             }
 
             PacketType::Unsubscribe => {
                 if body.remaining() < 2 {
-                    return Err(ProtocolError::Incomplete);
+                    return Err(ProtocolError::MalformedPacket("truncated packet id"));
                 }
                 let packet_id = body.get_u16();
                 if packet_id == 0 {
@@ -330,23 +354,23 @@ impl Decoder for MqttCodec {
                 }
                 if filters.is_empty() {
                     // MQTT-3.10.3-2: UNSUBSCRIBE deve contenere almeno un topic filter.
-                    return Err(ProtocolError::Incomplete);
+                    return Err(ProtocolError::MalformedPacket("empty unsubscribe payload"));
                 }
+
+                Self::ensure_empty(&body)?;
 
                 Ok(Some(Packet::Unsubscribe { packet_id, filters }))
             }
 
             PacketType::UnsubAck => {
                 if body.remaining() < 2 {
-                    return Err(ProtocolError::Incomplete);
-                }
-                if body.remaining() > 2 {
-                    return Err(ProtocolError::InvalidPacketType(first_byte));
+                    return Err(ProtocolError::MalformedPacket("truncated packet id"));
                 }
                 let packet_id = body.get_u16();
                 if packet_id == 0 {
                     return Err(ProtocolError::InvalidPacketId);
                 }
+                Self::ensure_empty(&body)?;
                 Ok(Some(Packet::UnsubAck { packet_id }))
             }
 
@@ -939,7 +963,7 @@ mod tests {
         let mut buf = BytesMut::from(&[0xA2, 0x02, 0x00, 0x01][..]);
         assert!(matches!(
             codec.decode(&mut buf),
-            Err(ProtocolError::Incomplete)
+            Err(ProtocolError::MalformedPacket(_))
         ));
 
         // UNSUBSCRIBE con packet_id = 0
@@ -960,7 +984,7 @@ mod tests {
         let mut buf = BytesMut::from(&[0xB0, 0x03, 0x00, 0x01, 0xFF][..]);
         assert!(matches!(
             codec.decode(&mut buf),
-            Err(ProtocolError::InvalidPacketType(0xB0))
+            Err(ProtocolError::MalformedPacket("trailing bytes"))
         ));
     }
 
@@ -1047,5 +1071,74 @@ mod tests {
             codec.decode(&mut buf_qos3),
             Err(ProtocolError::InvalidQoS(3))
         ));
+    }
+
+    #[test]
+    fn test_trailing_bytes_rejected_for_all_packet_types() {
+        let mut codec = MqttCodec::default();
+
+        // CONNECT valido + 1 byte in eccesso (remaining length 13 invece di 12)
+        let mut connect = BytesMut::from(
+            &[
+                0x10, 0x0D, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C, 0x00, 0x00,
+                0xFF,
+            ][..],
+        );
+        assert!(matches!(
+            codec.decode(&mut connect),
+            Err(ProtocolError::MalformedPacket("trailing bytes"))
+        ));
+
+        // CONNACK + 1 byte in eccesso
+        let mut connack = BytesMut::from(&[0x20, 0x03, 0x00, 0x00, 0xFF][..]);
+        assert!(matches!(
+            codec.decode(&mut connack),
+            Err(ProtocolError::MalformedPacket("trailing bytes"))
+        ));
+
+        // PUBACK + 1 byte in eccesso
+        let mut puback = BytesMut::from(&[0x40, 0x03, 0x00, 0x01, 0xFF][..]);
+        assert!(matches!(
+            codec.decode(&mut puback),
+            Err(ProtocolError::MalformedPacket("trailing bytes"))
+        ));
+
+        // UNSUBACK + 1 byte in eccesso
+        let mut unsuback = BytesMut::from(&[0xB0, 0x03, 0x00, 0x01, 0xFF][..]);
+        assert!(matches!(
+            codec.decode(&mut unsuback),
+            Err(ProtocolError::MalformedPacket("trailing bytes"))
+        ));
+
+        // PINGREQ, PINGRESP, DISCONNECT con 1 byte in eccesso
+        for raw in [
+            &[0xC0, 0x01, 0x00][..],
+            &[0xD0, 0x01, 0x00][..],
+            &[0xE0, 0x01, 0x00][..],
+        ] {
+            let mut buf = BytesMut::from(raw);
+            assert!(matches!(
+                codec.decode(&mut buf),
+                Err(ProtocolError::MalformedPacket("trailing bytes"))
+            ));
+        }
+
+        // SUBSCRIBE e UNSUBSCRIBE con byte troncato alla fine (frame completo ma corpo malformato)
+        let mut sub_junk =
+            BytesMut::from(&[0x82, 0x07, 0x00, 0x01, 0x00, 0x01, b'a', 0x00, 0xFF][..]);
+        assert!(matches!(
+            codec.decode(&mut sub_junk),
+            Err(ProtocolError::MalformedPacket(_))
+        ));
+
+        let mut unsub_junk = BytesMut::from(&[0xA2, 0x06, 0x00, 0x01, 0x00, 0x01, b'a', 0xFF][..]);
+        assert!(matches!(
+            codec.decode(&mut unsub_junk),
+            Err(ProtocolError::MalformedPacket(_))
+        ));
+
+        // SUBACK con codice non valido alla fine / corpo vuoto
+        let mut suback_bad = BytesMut::from(&[0x90, 0x04, 0x00, 0x01, 0x00, 0x7F][..]);
+        assert!(codec.decode(&mut suback_bad).is_err());
     }
 }
