@@ -35,6 +35,10 @@ impl MqttCodec {
         }
         let str_bytes = buf.split_to(str_len);
         let s = str::from_utf8(&str_bytes).map_err(|_| ProtocolError::InvalidUtf8)?;
+        // MQTT-1.5.3-2: le stringhe UTF-8 MQTT non possono contenere U+0000.
+        if s.contains('\0') {
+            return Err(ProtocolError::InvalidUtf8);
+        }
         Ok(s.to_string())
     }
 
@@ -272,6 +276,10 @@ impl Decoder for MqttCodec {
                 }
 
                 let topic = Self::decode_string(&mut body)?;
+                if topic.is_empty() {
+                    // MQTT-4.7.3-1: il Topic Name di un PUBLISH non può essere vuoto.
+                    return Err(ProtocolError::MalformedPacket("empty topic"));
+                }
 
                 let packet_id = if qos != QoS::AtMostOnce {
                     if body.remaining() < 2 {
@@ -1225,6 +1233,37 @@ mod tests {
         assert!(matches!(
             codec.decode(&mut buf),
             Err(ProtocolError::InvalidQoS(3))
+        ));
+    }
+
+    #[test]
+    fn test_string_nul_char_and_empty_publish_topic_rejected() {
+        let mut codec = MqttCodec::default();
+
+        // Stringa UTF-8 con U+0000 in PUBLISH topic -> InvalidUtf8 (MQTT-1.5.3-2)
+        let mut buf_nul = BytesMut::from(&[0x30, 0x05, 0x00, 0x03, b'a', 0x00, b'b'][..]);
+        assert!(matches!(
+            codec.decode(&mut buf_nul),
+            Err(ProtocolError::InvalidUtf8)
+        ));
+
+        // Stringa UTF-8 con U+0000 in CONNECT client_id -> InvalidUtf8
+        let mut buf_cid_nul = BytesMut::from(
+            &[
+                0x10, 0x0E, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C, 0x00, 0x02,
+                b'a', 0x00,
+            ][..],
+        );
+        assert!(matches!(
+            codec.decode(&mut buf_cid_nul),
+            Err(ProtocolError::InvalidUtf8)
+        ));
+
+        // PUBLISH con topic vuoto -> MalformedPacket("empty topic") (MQTT-4.7.3-1)
+        let mut buf_empty_topic = BytesMut::from(&[0x30, 0x02, 0x00, 0x00][..]);
+        assert!(matches!(
+            codec.decode(&mut buf_empty_topic),
+            Err(ProtocolError::MalformedPacket("empty topic"))
         ));
     }
 }
