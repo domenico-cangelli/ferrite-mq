@@ -5,14 +5,39 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::io::AsyncWrite;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, timeout, Duration, Instant};
 use tokio_util::codec::Framed;
 use tracing::{error, info, warn};
 
 type ClientSender = mpsc::Sender<Packet>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Tempo massimo concesso per scrivere un pacchetto sul socket di un client.
+/// Se il client non legge e il buffer TCP resta pieno oltre questa soglia,
+/// la connessione viene chiusa per evitare task appesi all'infinito.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Invia un pacchetto sul socket con timeout esplicito.
+async fn send_with_timeout<T>(
+    framed: &mut Framed<T, MqttCodec>,
+    packet: Packet,
+    write_timeout: Duration,
+) -> Result<(), BoxError>
+where
+    T: AsyncWrite + Unpin,
+{
+    match timeout(write_timeout, framed.send(packet)).await {
+        Ok(res) => res.map_err(Into::into),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "write timeout on client socket",
+        )
+        .into()),
+    }
+}
 
 /// QoS massimo che il broker sa consegnare *verso i subscriber*.
 ///
@@ -128,12 +153,15 @@ async fn handle_client(
     // pulizia sta dopo, fuori dal blocco. Rust non ha `finally`.
     let mut subscribed_filters: Vec<String> = Vec::new();
     let result = async {
-        framed
-            .send(Packet::ConnAck {
+        send_with_timeout(
+            &mut framed,
+            Packet::ConnAck {
                 session_present: false,
                 return_code: ConnectReturnCode::Accepted,
-            })
-            .await?;
+            },
+            WRITE_TIMEOUT,
+        )
+        .await?;
         session_loop(
             &mut framed,
             &mut rx,
@@ -172,7 +200,7 @@ async fn session_loop(
             // Messaggi in uscita dalla coda interna (es. pubblicazioni di altri client)
             outgoing = rx.recv() => {
                 match outgoing {
-                    Some(packet) => framed.send(packet).await?,
+                    Some(packet) => send_with_timeout(framed, packet, WRITE_TIMEOUT).await?,
                     None => {
                         // Il Sender è stato distrutto: un nuovo CONNECT ha preso il nostro client_id
                         info!("Client [{}] replaced by a new connection with the same client_id", client_id);
@@ -196,7 +224,7 @@ async fn session_loop(
 
                 match incoming {
                     Some(Ok(Packet::PingReq)) => {
-                        framed.send(Packet::PingResp).await?;
+                        send_with_timeout(framed, Packet::PingResp, WRITE_TIMEOUT).await?;
                     }
                     Some(Ok(Packet::Subscribe { packet_id, topics })) => {
                         // Il write lock sul trie vive solo dentro questo blocco: viene
@@ -216,7 +244,15 @@ async fn session_loop(
                                 })
                                 .collect::<Vec<_>>()
                         };
-                        framed.send(Packet::SubAck { packet_id, return_codes }).await?;
+                        send_with_timeout(
+                            framed,
+                            Packet::SubAck {
+                                packet_id,
+                                return_codes,
+                            },
+                            WRITE_TIMEOUT,
+                        )
+                        .await?;
                     }
                     Some(Ok(Packet::Publish {
                         topic,
@@ -230,7 +266,14 @@ async fn session_loop(
                         // dobbiamo confermarne la ricezione al publisher inviando PUBACK con lo stesso ID.
                         if qos == QoS::AtLeastOnce {
                             match packet_id {
-                                Some(id) => framed.send(Packet::PubAck { packet_id: id }).await?,
+                                Some(id) => {
+                                    send_with_timeout(
+                                        framed,
+                                        Packet::PubAck { packet_id: id },
+                                        WRITE_TIMEOUT,
+                                    )
+                                    .await?;
+                                }
                                 None => {
                                     warn!("[{}] Received QoS 1 PUBLISH without packet_id, protocol violation", client_id);
                                     return Ok(());
@@ -246,22 +289,40 @@ async fn session_loop(
 
                         // 3. Instradamento ai subscriber trovati
                         if !matched.is_empty() {
-                            let sessions = state.sessions.read().await;
-                            for sub in matched {
-                                if let Some(session) = sessions.get(&sub.client_id) {
-                                    let _ = session
-                                        .tx
-                                        .send(Packet::Publish {
-                                            topic: topic.clone(),
-                                            // Il QoS 1 in uscita non è ancora supportato (servirebbe un
-                                            // packet_id dedicato): consegniamo a QoS 0.
-                                            qos: QoS::AtMostOnce,
-                                            retain,
-                                            dup,
-                                            packet_id: None,
-                                            payload: payload.clone(),
-                                        })
-                                        .await;
+                            // Il read lock su `sessions` vive solo dentro questo blocco:
+                            // cloniamo i sender e rilasciamo il lock prima di inviare.
+                            let targets: Vec<(String, ClientSender)> = {
+                                let sessions = state.sessions.read().await;
+                                matched
+                                    .into_iter()
+                                    .filter_map(|sub| {
+                                        sessions
+                                            .get(&sub.client_id)
+                                            .map(|session| (sub.client_id, session.tx.clone()))
+                                    })
+                                    .collect()
+                            };
+
+                            for (target_client_id, tx) in targets {
+                                let outgoing = Packet::Publish {
+                                    topic: topic.clone(),
+                                    // Il QoS 1 in uscita non è ancora supportato (servirebbe un
+                                    // packet_id dedicato): consegniamo a QoS 0.
+                                    qos: QoS::AtMostOnce,
+                                    retain,
+                                    dup,
+                                    packet_id: None,
+                                    payload: payload.clone(),
+                                };
+                                match tx.try_send(outgoing) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        warn!(
+                                            "Dropping QoS 0 message for slow client [{}]: outbound queue full",
+                                            target_client_id
+                                        );
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {}
                                 }
                             }
                         }
@@ -351,5 +412,33 @@ mod tests {
             .await;
         assert!(!state.sessions.read().await.contains_key("client"));
         assert!(state.trie.read().await.match_topic("new/topic").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_send_with_timeout_errors_when_peer_does_not_read() {
+        // Buffer minuscolo (16 byte) e nessun lettore su `_peer`.
+        let (writer, _peer) = tokio::io::duplex(16);
+        let mut framed = Framed::new(writer, MqttCodec::default());
+
+        // Pacchetto più grande del buffer: la scrittura si blocca finché scade il timeout.
+        let large_packet = Packet::Publish {
+            topic: "slow/consumer".into(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            dup: false,
+            packet_id: None,
+            payload: bytes::Bytes::from(vec![b'x'; 256]),
+        };
+
+        let result = send_with_timeout(&mut framed, large_packet, Duration::from_millis(50)).await;
+        assert!(
+            result.is_err(),
+            "send_with_timeout doveva restituire errore di timeout"
+        );
+        let err = result.unwrap_err();
+        let io_err = err
+            .downcast_ref::<std::io::Error>()
+            .expect("atteso std::io::Error");
+        assert_eq!(io_err.kind(), std::io::ErrorKind::TimedOut);
     }
 }
