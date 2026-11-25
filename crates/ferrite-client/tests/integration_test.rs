@@ -531,3 +531,127 @@ async fn test_self_subscriber_flood_does_not_freeze_broker() {
         "il broker si è congelato durante il flood del self-subscriber"
     );
 }
+
+#[tokio::test]
+async fn test_subscribe_mixed_filters_returns_failure_and_keeps_connection_open() {
+    let broker_addr = start_test_broker().await;
+
+    let mut sub = raw_connect(broker_addr, "sub-mixed", 60).await;
+    sub.send(Packet::Subscribe {
+        packet_id: 10,
+        topics: vec![
+            ferrite_protocol::SubscribeTopic {
+                filter: "a/#/b".into(),
+                qos: QoS::AtMostOnce,
+            },
+            ferrite_protocol::SubscribeTopic {
+                filter: "ok/+".into(),
+                qos: QoS::AtLeastOnce,
+            },
+        ],
+    })
+    .await
+    .unwrap();
+
+    let response = timeout(Duration::from_secs(2), sub.next())
+        .await
+        .expect("Timeout waiting for SUBACK")
+        .expect("Connection closed after invalid filter")
+        .expect("Protocol error");
+
+    assert_eq!(
+        response,
+        Packet::SubAck {
+            packet_id: 10,
+            return_codes: vec![
+                ferrite_protocol::SubAckReturnCode::Failure,
+                ferrite_protocol::SubAckReturnCode::SuccessQoS0,
+            ],
+        }
+    );
+
+    // La connessione deve restare aperta e continuare a ricevere messaggi su "ok/+".
+    let (pub_client, _pub_rx) = connect(MqttOptions::new("pub-mixed", broker_addr))
+        .await
+        .unwrap();
+    pub_client
+        .publish("ok/hello", Bytes::from_static(b"alive"))
+        .await
+        .unwrap();
+
+    let received = timeout(Duration::from_secs(2), sub.next())
+        .await
+        .expect("Timeout waiting for PUBLISH on open connection")
+        .expect("Connection closed unexpectedly")
+        .expect("Protocol error");
+    match received {
+        Packet::Publish { topic, payload, .. } => {
+            assert_eq!(topic, "ok/hello");
+            assert_eq!(payload, Bytes::from_static(b"alive"));
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
+
+    pub_client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_publish_invalid_topic_closes_connection_and_does_not_deliver() {
+    let broker_addr = start_test_broker().await;
+
+    let (sub_client, mut sub_rx) = connect(MqttOptions::new("sub-ab", broker_addr))
+        .await
+        .unwrap();
+    sub_client.subscribe("a/b", QoS::AtMostOnce).await.unwrap();
+    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(suback, Packet::SubAck { .. }));
+
+    // 1. PUBLISH con wildcard "a/+" deve chiudere la connessione del publisher.
+    let mut pub_wildcard = raw_connect(broker_addr, "pub-wildcard", 60).await;
+    pub_wildcard
+        .send(Packet::Publish {
+            topic: "a/+".into(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from_static(b"bad"),
+        })
+        .await
+        .unwrap();
+    let closed_wildcard = timeout(Duration::from_secs(2), pub_wildcard.next())
+        .await
+        .expect("il broker non ha chiuso la connessione dopo PUBLISH su 'a/+'");
+    assert!(closed_wildcard.is_none());
+
+    // 2. PUBLISH con topic vuoto "" deve chiudere la connessione del publisher.
+    let mut pub_empty = raw_connect(broker_addr, "pub-empty", 60).await;
+    pub_empty
+        .send(Packet::Publish {
+            topic: String::new(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from_static(b"bad"),
+        })
+        .await
+        .unwrap();
+    let closed_empty = timeout(Duration::from_secs(2), pub_empty.next())
+        .await
+        .expect("il broker non ha chiuso la connessione dopo PUBLISH su topic vuoto");
+    assert!(closed_empty.is_none());
+
+    // 3. Il subscriber su "a/b" non deve aver ricevuto nulla.
+    let nothing = timeout(Duration::from_millis(200), sub_rx.recv()).await;
+    assert!(
+        nothing.is_err(),
+        "il subscriber ha ricevuto un messaggio inatteso: {:?}",
+        nothing
+    );
+
+    sub_client.disconnect().await.unwrap();
+}
