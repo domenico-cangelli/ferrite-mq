@@ -80,6 +80,55 @@ pub fn validate_filter(filter: &str) -> Result<(), FilterError> {
     Ok(())
 }
 
+/// Errore di validazione di un MQTT Topic Name usato in `PUBLISH` (MQTT-3.3.2 / MQTT-4.7.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopicNameError {
+    Empty,
+    TooLong,
+    Wildcard,
+    NulChar,
+}
+
+impl fmt::Display for TopicNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TopicNameError::Empty => write!(f, "topic name cannot be empty"),
+            TopicNameError::TooLong => {
+                write!(
+                    f,
+                    "topic name exceeds maximum length of {MAX_FILTER_BYTES} bytes"
+                )
+            }
+            TopicNameError::Wildcard => {
+                write!(
+                    f,
+                    "topic name cannot contain wildcard characters '+' or '#'"
+                )
+            }
+            TopicNameError::NulChar => write!(f, "topic name cannot contain NUL (U+0000)"),
+        }
+    }
+}
+
+impl std::error::Error for TopicNameError {}
+
+/// Valida un MQTT Topic Name concreto (usato in `PUBLISH`, MQTT-3.3.2-2 e MQTT-4.7.3-1).
+pub fn validate_topic_name(topic: &str) -> Result<(), TopicNameError> {
+    if topic.is_empty() {
+        return Err(TopicNameError::Empty);
+    }
+    if topic.len() > MAX_FILTER_BYTES {
+        return Err(TopicNameError::TooLong);
+    }
+    if topic.contains('\0') {
+        return Err(TopicNameError::NulChar);
+    }
+    if topic.contains('+') || topic.contains('#') {
+        return Err(TopicNameError::Wildcard);
+    }
+    Ok(())
+}
+
 /// Rappresenta una sottoscrizione effettuata da un client a un topic filter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Subscription {
@@ -514,5 +563,24 @@ mod tests {
         assert_eq!(trie.match_topic("a/").len(), 1);
         assert_eq!(trie.match_topic("a/b").len(), 1);
         assert!(trie.match_topic("ab").is_empty());
+    }
+
+    #[test]
+    fn test_validate_topic_name() {
+        for topic in ["a", "a/b", "/a", "a/", "$SYS/broker/load"] {
+            assert_eq!(
+                validate_topic_name(topic),
+                Ok(()),
+                "topic valido rifiutato: {topic:?}"
+            );
+        }
+        assert_eq!(validate_topic_name(""), Err(TopicNameError::Empty));
+        assert_eq!(
+            validate_topic_name(&"a".repeat(MAX_FILTER_BYTES + 1)),
+            Err(TopicNameError::TooLong)
+        );
+        assert_eq!(validate_topic_name("a/+"), Err(TopicNameError::Wildcard));
+        assert_eq!(validate_topic_name("a/#"), Err(TopicNameError::Wildcard));
+        assert_eq!(validate_topic_name("a/\0/b"), Err(TopicNameError::NulChar));
     }
 }

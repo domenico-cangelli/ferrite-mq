@@ -1,4 +1,4 @@
-use crate::trie::TopicTrie;
+use crate::trie::{validate_topic_name, TopicTrie};
 use ferrite_protocol::{
     ConnectReturnCode, MqttCodec, Packet, QoS, SubAckReturnCode, SubscribeTopic,
 };
@@ -291,6 +291,14 @@ async fn session_loop(
                         packet_id,
                         payload,
                     })) => {
+                        if let Err(err) = validate_topic_name(&topic) {
+                            warn!(
+                                "[{}] Received PUBLISH with invalid topic {:?} ({}), protocol violation (MQTT-3.3.2-2 / MQTT-4.7.3-1)",
+                                client_id, topic, err
+                            );
+                            return Ok(());
+                        }
+
                         // 1. Regola QoS 1: se il messaggio ricevuto è AtLeastOnce,
                         // dobbiamo confermarne la ricezione al publisher inviando PUBACK con lo stesso ID.
                         if qos == QoS::AtLeastOnce {
