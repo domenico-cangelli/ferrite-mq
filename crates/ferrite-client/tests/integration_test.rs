@@ -655,3 +655,44 @@ async fn test_publish_invalid_topic_closes_connection_and_does_not_deliver() {
 
     sub_client.disconnect().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_connect_protocol_level_5_receives_connack_0x01_and_closes() {
+    let broker_addr = start_test_broker().await;
+
+    let stream = tokio::net::TcpStream::connect(broker_addr).await.unwrap();
+    let mut framed = Framed::new(stream, MqttCodec::default());
+
+    framed
+        .send(Packet::Connect {
+            protocol_version: ProtocolVersion::Mqtt50,
+            clean_session: true,
+            keep_alive: 60,
+            client_id: "mqtt5-client".into(),
+            will: None,
+            username: None,
+            password: None,
+        })
+        .await
+        .unwrap();
+
+    let response = timeout(Duration::from_secs(2), framed.next())
+        .await
+        .expect("Timeout waiting for CONNACK 0x01")
+        .expect("Connection closed before CONNACK")
+        .expect("Protocol error");
+
+    assert_eq!(
+        response,
+        Packet::ConnAck {
+            session_present: false,
+            return_code: ferrite_protocol::ConnectReturnCode::RefusedUnacceptableProtocolVersion,
+        }
+    );
+
+    // Dopo CONNACK 0x01 il broker deve chiudere la socket.
+    let closed = timeout(Duration::from_secs(2), framed.next())
+        .await
+        .expect("Timeout waiting for socket close after CONNACK 0x01");
+    assert!(closed.is_none());
+}
