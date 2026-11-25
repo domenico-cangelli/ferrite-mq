@@ -215,4 +215,11 @@ pub enum Packet {
     PubAck {
         packet_id: u16,
     },
+    Unsubscribe {
+        packet_id: u16,
+        filters: Vec<String>,
+    },
+    UnsubAck {
+        packet_id: u16,
+    },
 }

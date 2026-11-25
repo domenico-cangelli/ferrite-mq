@@ -280,15 +280,55 @@ impl Decoder for MqttCodec {
                 Ok(Some(Packet::PubAck { packet_id }))
             }
 
-            // Pacchetti previsti da MQTT ma non ancora implementati (QoS 2, UNSUBSCRIBE, AUTH).
+            PacketType::Unsubscribe => {
+                // MQTT-3.10.1-1: i bit 3..0 del fixed header di UNSUBSCRIBE devono essere 0010 (0x02).
+                if (first_byte & 0x0F) != 0x02 {
+                    return Err(ProtocolError::InvalidPacketType(first_byte));
+                }
+                if body.remaining() < 2 {
+                    return Err(ProtocolError::Incomplete);
+                }
+                let packet_id = body.get_u16();
+                if packet_id == 0 {
+                    return Err(ProtocolError::InvalidPacketId);
+                }
+
+                let mut filters = Vec::new();
+                while body.has_remaining() {
+                    filters.push(Self::decode_string(&mut body)?);
+                }
+                if filters.is_empty() {
+                    // MQTT-3.10.3-2: UNSUBSCRIBE deve contenere almeno un topic filter.
+                    return Err(ProtocolError::Incomplete);
+                }
+
+                Ok(Some(Packet::Unsubscribe { packet_id, filters }))
+            }
+
+            PacketType::UnsubAck => {
+                // I bit 3..0 del fixed header di UNSUBACK devono essere 0000 e il corpo esattamente 2 byte.
+                if (first_byte & 0x0F) != 0x00 {
+                    return Err(ProtocolError::InvalidPacketType(first_byte));
+                }
+                if body.remaining() < 2 {
+                    return Err(ProtocolError::Incomplete);
+                }
+                if body.remaining() > 2 {
+                    return Err(ProtocolError::InvalidPacketType(first_byte));
+                }
+                let packet_id = body.get_u16();
+                if packet_id == 0 {
+                    return Err(ProtocolError::InvalidPacketId);
+                }
+                Ok(Some(Packet::UnsubAck { packet_id }))
+            }
+
+            // Pacchetti previsti da MQTT ma non ancora implementati (QoS 2, AUTH).
             // I loro byte sono già stati consumati dal buffer: restituire `Ok(None)` li
             // farebbe sparire in silenzio, quindi segnaliamo un errore esplicito.
-            PacketType::PubRec
-            | PacketType::PubRel
-            | PacketType::PubComp
-            | PacketType::Unsubscribe
-            | PacketType::UnsubAck
-            | PacketType::Auth => Err(ProtocolError::InvalidPacketType(packet_type as u8)),
+            PacketType::PubRec | PacketType::PubRel | PacketType::PubComp | PacketType::Auth => {
+                Err(ProtocolError::InvalidPacketType(packet_type as u8))
+            }
         }
     }
 }
@@ -473,6 +513,30 @@ impl Encoder<Packet> for MqttCodec {
                 // Remaining Length: esattamente 2 byte (la dimensione dell'u16 packet_id)
                 dst.put_u8(2);
                 // Variable Header: Packet Identifier
+                dst.put_u16(packet_id);
+            }
+
+            Packet::Unsubscribe { packet_id, filters } => {
+                // MQTT-3.10.1-1: flag fissi 0010 (0x02)
+                let first_byte = ((PacketType::Unsubscribe as u8) << 4) | 0x02;
+
+                let mut body = BytesMut::new();
+                body.put_u16(packet_id);
+                for filter in filters {
+                    Self::encode_string(&filter, &mut body);
+                }
+
+                dst.put_u8(first_byte);
+                let mut varint_buf = Vec::with_capacity(4);
+                encode_varint(body.len(), &mut varint_buf)?;
+                dst.put_slice(&varint_buf);
+                dst.put(body);
+            }
+
+            Packet::UnsubAck { packet_id } => {
+                // Fixed Header: tipo 11 (0xB0), flag 0, remaining length 2
+                dst.put_u8((PacketType::UnsubAck as u8) << 4);
+                dst.put_u8(2);
                 dst.put_u16(packet_id);
             }
         }
@@ -779,5 +843,113 @@ mod tests {
         let result = codec.decode(&mut buffer);
         assert!(matches!(result, Err(ProtocolError::InvalidPacketType(_))));
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_unsubscribe_and_unsuback_roundtrip() {
+        let mut codec = MqttCodec::default();
+        let mut buffer = BytesMut::new();
+
+        // UNSUBSCRIBE con un singolo filtro
+        let unsub_single = Packet::Unsubscribe {
+            packet_id: 7,
+            filters: vec!["a/b".to_string()],
+        };
+        codec.encode(unsub_single.clone(), &mut buffer).unwrap();
+        assert_eq!(buffer[0], 0xA2);
+        assert_eq!(codec.decode(&mut buffer).unwrap(), Some(unsub_single));
+        assert!(buffer.is_empty());
+
+        // UNSUBSCRIBE con più filtri
+        let unsub_multi = Packet::Unsubscribe {
+            packet_id: 42,
+            filters: vec!["sensors/+/temp".to_string(), "alerts/#".to_string()],
+        };
+        codec.encode(unsub_multi.clone(), &mut buffer).unwrap();
+        assert_eq!(buffer[0], 0xA2);
+        assert_eq!(codec.decode(&mut buffer).unwrap(), Some(unsub_multi));
+        assert!(buffer.is_empty());
+
+        // UNSUBACK
+        let unsuback = Packet::UnsubAck { packet_id: 42 };
+        codec.encode(unsuback.clone(), &mut buffer).unwrap();
+        assert_eq!(&buffer[..], &[0xB0, 0x02, 0x00, 0x2A]);
+        assert_eq!(codec.decode(&mut buffer).unwrap(), Some(unsuback));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_unsubscribe_and_unsuback_validation_errors() {
+        let mut codec = MqttCodec::default();
+
+        // UNSUBSCRIBE flag sbagliati (0xA0 invece di 0xA2)
+        let mut buf = BytesMut::from(&[0xA0, 0x05, 0x00, 0x01, 0x00, 0x01, b'a'][..]);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(ProtocolError::InvalidPacketType(0xA0))
+        ));
+
+        // UNSUBACK flag sbagliati (0xB1 invece di 0xB0)
+        let mut buf = BytesMut::from(&[0xB1, 0x02, 0x00, 0x01][..]);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(ProtocolError::InvalidPacketType(0xB1))
+        ));
+
+        // UNSUBSCRIBE con zero filtri (MQTT-3.10.3-2)
+        let mut buf = BytesMut::from(&[0xA2, 0x02, 0x00, 0x01][..]);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(ProtocolError::Incomplete)
+        ));
+
+        // UNSUBSCRIBE con packet_id = 0
+        let mut buf = BytesMut::from(&[0xA2, 0x05, 0x00, 0x00, 0x00, 0x01, b'a'][..]);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(ProtocolError::InvalidPacketId)
+        ));
+
+        // UNSUBACK con packet_id = 0
+        let mut buf = BytesMut::from(&[0xB0, 0x02, 0x00, 0x00][..]);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(ProtocolError::InvalidPacketId)
+        ));
+
+        // UNSUBACK con byte in eccesso (remaining length 3)
+        let mut buf = BytesMut::from(&[0xB0, 0x03, 0x00, 0x01, 0xFF][..]);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(ProtocolError::InvalidPacketType(0xB0))
+        ));
+    }
+
+    #[test]
+    fn test_unsubscribe_and_unsuback_incomplete_buffer() {
+        let mut codec = MqttCodec::default();
+
+        // UNSUBSCRIBE spezzato a metà
+        let mut buf = BytesMut::from(&[0xA2, 0x05, 0x00, 0x01, 0x00][..]);
+        assert_eq!(codec.decode(&mut buf).unwrap(), None);
+        buf.put_slice(&[0x01, b'a']);
+        assert_eq!(
+            codec.decode(&mut buf).unwrap(),
+            Some(Packet::Unsubscribe {
+                packet_id: 1,
+                filters: vec!["a".to_string()],
+            })
+        );
+        assert!(buf.is_empty());
+
+        // UNSUBACK spezzato a metà
+        let mut buf = BytesMut::from(&[0xB0, 0x02, 0x00][..]);
+        assert_eq!(codec.decode(&mut buf).unwrap(), None);
+        buf.put_u8(0x09);
+        assert_eq!(
+            codec.decode(&mut buf).unwrap(),
+            Some(Packet::UnsubAck { packet_id: 9 })
+        );
+        assert!(buf.is_empty());
     }
 }
