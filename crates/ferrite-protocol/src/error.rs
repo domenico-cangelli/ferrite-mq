@@ -23,4 +23,7 @@ pub enum ProtocolError {
 
     #[error("Packet exceeds maximum allowed size")]
     PacketTooLarge,
+
+    #[error("Invalid packet identifier: 0 is forbidden by MQTT specification")]
+    InvalidPacketId,
 }

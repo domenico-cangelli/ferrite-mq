@@ -184,7 +184,11 @@ impl Decoder for MqttCodec {
                     if body.remaining() < 2 {
                         return Err(ProtocolError::Incomplete);
                     }
-                    Some(body.get_u16())
+                    let id = body.get_u16();
+                    if id == 0 {
+                        return Err(ProtocolError::InvalidPacketId);
+                    }
+                    Some(id)
                 } else {
                     None
                 };
@@ -207,6 +211,9 @@ impl Decoder for MqttCodec {
                     return Err(ProtocolError::Incomplete);
                 }
                 let packet_id = body.get_u16();
+                if packet_id == 0 {
+                    return Err(ProtocolError::InvalidPacketId);
+                }
 
                 // Il payload contiene 1 o più tuple: [lunghezza_stringa + stringa + 1_byte_qos]
                 let mut topics = Vec::new();
@@ -233,6 +240,9 @@ impl Decoder for MqttCodec {
                     return Err(ProtocolError::Incomplete);
                 }
                 let packet_id = body.get_u16();
+                if packet_id == 0 {
+                    return Err(ProtocolError::InvalidPacketId);
+                }
 
                 let mut return_codes = Vec::new();
                 while body.has_remaining() {
@@ -252,6 +262,9 @@ impl Decoder for MqttCodec {
                     return Err(ProtocolError::Incomplete);
                 }
                 let packet_id = body.get_u16();
+                if packet_id == 0 {
+                    return Err(ProtocolError::InvalidPacketId);
+                }
                 Ok(Some(Packet::PubAck { packet_id }))
             }
 
@@ -610,5 +623,84 @@ mod tests {
 
         // Il pacchetto non supportato è stato consumato: il successivo si decodifica normalmente
         assert_eq!(codec.decode(&mut buffer).unwrap(), Some(Packet::PingReq));
+    }
+
+    #[test]
+    fn test_packet_id_zero_rejected_for_publish_qos1_and_qos2() {
+        let mut codec = MqttCodec::default();
+
+        for qos in [QoS::AtLeastOnce, QoS::ExactlyOnce] {
+            let mut buffer = BytesMut::new();
+            codec
+                .encode(
+                    Packet::Publish {
+                        topic: "a/b".to_string(),
+                        qos,
+                        retain: false,
+                        dup: false,
+                        packet_id: Some(0),
+                        payload: Bytes::from_static(b"hi"),
+                    },
+                    &mut buffer,
+                )
+                .unwrap();
+
+            let result = codec.decode(&mut buffer);
+            assert!(
+                matches!(result, Err(ProtocolError::InvalidPacketId)),
+                "atteso InvalidPacketId per PUBLISH {:?}",
+                qos
+            );
+        }
+    }
+
+    #[test]
+    fn test_packet_id_zero_rejected_for_puback_subscribe_suback() {
+        let mut codec = MqttCodec::default();
+
+        // PUBACK con packet_id = 0
+        let mut buf_puback = BytesMut::new();
+        codec
+            .encode(Packet::PubAck { packet_id: 0 }, &mut buf_puback)
+            .unwrap();
+        assert!(matches!(
+            codec.decode(&mut buf_puback),
+            Err(ProtocolError::InvalidPacketId)
+        ));
+
+        // SUBSCRIBE con packet_id = 0
+        let mut buf_sub = BytesMut::new();
+        codec
+            .encode(
+                Packet::Subscribe {
+                    packet_id: 0,
+                    topics: vec![crate::SubscribeTopic {
+                        filter: "a/b".to_string(),
+                        qos: QoS::AtMostOnce,
+                    }],
+                },
+                &mut buf_sub,
+            )
+            .unwrap();
+        assert!(matches!(
+            codec.decode(&mut buf_sub),
+            Err(ProtocolError::InvalidPacketId)
+        ));
+
+        // SUBACK con packet_id = 0
+        let mut buf_suback = BytesMut::new();
+        codec
+            .encode(
+                Packet::SubAck {
+                    packet_id: 0,
+                    return_codes: vec![crate::SubAckReturnCode::SuccessQoS0],
+                },
+                &mut buf_suback,
+            )
+            .unwrap();
+        assert!(matches!(
+            codec.decode(&mut buf_suback),
+            Err(ProtocolError::InvalidPacketId)
+        ));
     }
 }
