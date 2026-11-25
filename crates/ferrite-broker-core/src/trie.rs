@@ -257,16 +257,21 @@ impl TopicTrie {
         idx: usize,
         results: &mut HashMap<String, QoS>,
     ) {
+        // MQTT-4.7.2-1: un topic che inizia con '$' non deve matchare i wildcard '#' o '+' in radice.
+        let skip_root_wildcards = idx == 0 && tokens.first().is_some_and(|t| t.starts_with('$'));
+
         // 1. Chiunque sia sottoscritto con '#' a questo livello matcha tutto ciò che segue
-        for (client_id, &qos) in &node.hash_subscribers {
-            results
-                .entry(client_id.clone())
-                .and_modify(|existing_qos| {
-                    if qos as u8 > *existing_qos as u8 {
-                        *existing_qos = qos;
-                    }
-                })
-                .or_insert(qos);
+        if !skip_root_wildcards {
+            for (client_id, &qos) in &node.hash_subscribers {
+                results
+                    .entry(client_id.clone())
+                    .and_modify(|existing_qos| {
+                        if qos as u8 > *existing_qos as u8 {
+                            *existing_qos = qos;
+                        }
+                    })
+                    .or_insert(qos);
+            }
         }
 
         // 2. Se abbiamo esaminato tutti i token del topic concreto
@@ -292,8 +297,10 @@ impl TopicTrie {
         }
 
         // 4. Match tramite wildcard '+'
-        if let Some(plus) = node.plus_child.as_deref() {
-            Self::match_recursive(plus, tokens, idx + 1, results);
+        if !skip_root_wildcards {
+            if let Some(plus) = node.plus_child.as_deref() {
+                Self::match_recursive(plus, tokens, idx + 1, results);
+            }
         }
     }
 }
@@ -460,5 +467,52 @@ mod tests {
 
         trie.remove_client("client1");
         assert_eq!(trie.node_count(), 1);
+    }
+
+    #[test]
+    fn test_dollar_topics_do_not_match_root_wildcards() {
+        let mut trie = TopicTrie::new();
+        trie.subscribe("#", "root_hash".into(), QoS::AtMostOnce);
+        trie.subscribe("+/x", "root_plus".into(), QoS::AtMostOnce);
+        trie.subscribe("$SYS/#", "sys_hash".into(), QoS::AtMostOnce);
+        trie.subscribe("$SYS/+", "sys_plus".into(), QoS::AtMostOnce);
+
+        // MQTT-4.7.2-1: '#' e '+/x' non ricevono '$SYS/x'; '$SYS/#' e '$SYS/+' sì.
+        let mut matches_x: Vec<String> = trie
+            .match_topic("$SYS/x")
+            .into_iter()
+            .map(|s| s.client_id)
+            .collect();
+        matches_x.sort();
+        assert_eq!(matches_x, vec!["sys_hash", "sys_plus"]);
+
+        // '$SYS/broker/load' matcha solo '$SYS/#' (non '#' in radice, non '$SYS/+').
+        let matches_load: Vec<String> = trie
+            .match_topic("$SYS/broker/load")
+            .into_iter()
+            .map(|s| s.client_id)
+            .collect();
+        assert_eq!(matches_load, vec!["sys_hash"]);
+
+        // Un topic normale matcha comunque '#' e '+/x'.
+        let mut matches_normal: Vec<String> = trie
+            .match_topic("normal/x")
+            .into_iter()
+            .map(|s| s.client_id)
+            .collect();
+        matches_normal.sort();
+        assert_eq!(matches_normal, vec!["root_hash", "root_plus"]);
+    }
+
+    #[test]
+    fn test_wildcard_hash_matches_parent_level() {
+        // MQTT-4.7.1-2: 'a/#' include anche il livello padre 'a'.
+        let mut trie = TopicTrie::new();
+        trie.subscribe("a/#", "sub".into(), QoS::AtMostOnce);
+
+        assert_eq!(trie.match_topic("a").len(), 1);
+        assert_eq!(trie.match_topic("a/").len(), 1);
+        assert_eq!(trie.match_topic("a/b").len(), 1);
+        assert!(trie.match_topic("ab").is_empty());
     }
 }
