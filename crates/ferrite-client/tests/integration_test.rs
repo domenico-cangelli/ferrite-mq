@@ -1189,3 +1189,66 @@ async fn test_broker_unsubscribe_unknown_filter_returns_unsuback_and_stays_open(
         .expect("Protocol error");
     assert_eq!(pingresp, Packet::PingResp);
 }
+
+#[tokio::test]
+async fn test_client_unsubscribe_waits_for_unsuback_and_stops_receiving() {
+    let broker_addr = start_test_broker().await;
+
+    let (sub_client, mut sub_rx) = connect(MqttOptions::new("client-unsub", broker_addr))
+        .await
+        .unwrap();
+    sub_client
+        .subscribe("updates/news", QoS::AtMostOnce)
+        .await
+        .unwrap();
+    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(suback, Packet::SubAck { .. }));
+
+    let (pub_client, _pub_rx) = connect(MqttOptions::new("pub-news", broker_addr))
+        .await
+        .unwrap();
+
+    // 1. Prima dell'unsubscribe il messaggio arriva normalmente
+    pub_client
+        .publish("updates/news", Bytes::from_static(b"msg-1"))
+        .await
+        .unwrap();
+    let first = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .expect("Timeout waiting for first PUBLISH")
+        .expect("Channel closed");
+    match first {
+        Packet::Publish { topic, payload, .. } => {
+            assert_eq!(topic, "updates/news");
+            assert_eq!(payload, Bytes::from_static(b"msg-1"));
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
+
+    // 2. Unsubscribe attende UNSUBACK (che non viene inoltrato a sub_rx)
+    timeout(
+        Duration::from_secs(2),
+        sub_client.unsubscribe("updates/news"),
+    )
+    .await
+    .expect("Timeout waiting for unsubscribe UNSUBACK")
+    .expect("unsubscribe failed");
+
+    // 3. Dopo l'unsubscribe nessun messaggio (e nessun UNSUBACK) deve arrivare su sub_rx
+    pub_client
+        .publish("updates/news", Bytes::from_static(b"msg-2"))
+        .await
+        .unwrap();
+    let nothing = timeout(Duration::from_millis(300), sub_rx.recv()).await;
+    assert!(
+        nothing.is_err(),
+        "ricevuto pacchetto inatteso dopo unsubscribe: {:?}",
+        nothing
+    );
+
+    pub_client.disconnect().await.unwrap();
+    sub_client.disconnect().await.unwrap();
+}
