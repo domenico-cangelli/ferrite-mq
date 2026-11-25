@@ -1,7 +1,9 @@
 use crate::trie::TopicTrie;
-use ferrite_protocol::{ConnectReturnCode, MqttCodec, Packet, QoS, SubAckReturnCode};
+use ferrite_protocol::{
+    ConnectReturnCode, MqttCodec, Packet, QoS, SubAckReturnCode, SubscribeTopic,
+};
 use futures::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -51,6 +53,36 @@ fn granted_qos(requested: QoS) -> QoS {
     requested.min(MAX_GRANTED_QOS)
 }
 
+/// Applica i filtri di un pacchetto `SUBSCRIBE` al trie, restituendo un codice SUBACK
+/// per ogni filtro nello stesso ordine. I filtri invalidi ricevono `Failure` (0x80)
+/// e non vengono aggiunti né al trie né a `filters`.
+fn apply_subscribe(
+    trie: &mut TopicTrie,
+    client_id: &str,
+    topics: &[SubscribeTopic],
+    filters: &mut HashSet<String>,
+) -> Vec<SubAckReturnCode> {
+    topics
+        .iter()
+        .map(|topic| {
+            let granted = granted_qos(topic.qos);
+            match trie.try_subscribe(&topic.filter, client_id.to_string(), granted) {
+                Ok(()) => {
+                    filters.insert(topic.filter.clone());
+                    SubAckReturnCode::from(granted)
+                }
+                Err(err) => {
+                    warn!(
+                        "[{}] Rejecting invalid SUBSCRIBE filter {:?}: {}",
+                        client_id, topic.filter, err
+                    );
+                    SubAckReturnCode::Failure
+                }
+            }
+        })
+        .collect()
+}
+
 /// Sessione attiva di un client: canale verso la sua connessione + identificativo
 /// univoco della *connessione* (non del client_id, che può essere riusato).
 pub struct SessionHandle {
@@ -84,7 +116,7 @@ impl BrokerState {
     /// Pulizia a fine connessione. Agisce solo se questa connessione è ancora la
     /// proprietaria del `client_id`: se un'altra l'ha rimpiazzata, sessione e
     /// sottoscrizioni ora appartengono a quella e non vanno toccate.
-    async fn release_session(&self, client_id: &str, conn_id: u64, filters: &[String]) {
+    async fn release_session(&self, client_id: &str, conn_id: u64, filters: &HashSet<String>) {
         let mut trie = self.trie.write().await;
         let mut sessions = self.sessions.write().await;
         let still_owner = sessions
@@ -151,7 +183,7 @@ async fn handle_client(
     // 3. Da qui in poi qualsiasi errore (anche propagato con `?`) deve comunque
     // passare dalla pulizia: per questo il ciclo vive in un blocco separato e la
     // pulizia sta dopo, fuori dal blocco. Rust non ha `finally`.
-    let mut subscribed_filters: Vec<String> = Vec::new();
+    let mut subscribed_filters: HashSet<String> = HashSet::new();
     let result = async {
         send_with_timeout(
             &mut framed,
@@ -188,7 +220,7 @@ async fn session_loop(
     client_id: &str,
     keep_alive: Option<Duration>,
     state: &BrokerState,
-    subscribed_filters: &mut Vec<String>,
+    subscribed_filters: &mut HashSet<String>,
 ) -> Result<(), BoxError> {
     // Watchdog di inattività. Il timer vive *fuori* dal loop e viene riarmato solo quando
     // il client ci scrive qualcosa: il traffico in uscita verso di lui non lo conta.
@@ -227,22 +259,19 @@ async fn session_loop(
                         send_with_timeout(framed, Packet::PingResp, WRITE_TIMEOUT).await?;
                     }
                     Some(Ok(Packet::Subscribe { packet_id, topics })) => {
+                        if topics.is_empty() {
+                            warn!(
+                                "[{}] Received SUBSCRIBE with empty topic list, protocol violation (MQTT-3.8.3-3)",
+                                client_id
+                            );
+                            return Ok(());
+                        }
                         // Il write lock sul trie vive solo dentro questo blocco: viene
                         // rilasciato prima dell'I/O di rete, altrimenti un client lento
                         // nel ricevere il SUBACK bloccherebbe tutti gli altri.
                         let return_codes = {
                             let mut trie = state.trie.write().await;
-                            topics
-                                .into_iter()
-                                .map(|topic| {
-                                    // Nel trie salviamo il QoS *concesso*, non quello richiesto:
-                                    // deve coincidere con quanto comunichiamo nel SUBACK.
-                                    let granted = granted_qos(topic.qos);
-                                    trie.subscribe(&topic.filter, client_id.to_string(), granted);
-                                    subscribed_filters.push(topic.filter);
-                                    SubAckReturnCode::from(granted)
-                                })
-                                .collect::<Vec<_>>()
+                            apply_subscribe(&mut trie, client_id, &topics, subscribed_filters)
                         };
                         send_with_timeout(
                             framed,
@@ -399,19 +428,69 @@ mod tests {
             .subscribe("new/topic", "client".into(), QoS::AtMostOnce);
 
         // La vecchia connessione (conn 1) fa pulizia dopo essere stata rimpiazzata
-        state
-            .release_session("client", 1, &["new/topic".to_string()])
-            .await;
+        let filters = HashSet::from(["new/topic".to_string()]);
+        state.release_session("client", 1, &filters).await;
 
         assert!(state.sessions.read().await.contains_key("client"));
         assert_eq!(state.trie.read().await.match_topic("new/topic").len(), 1);
 
         // La proprietaria legittima (conn 2) fa pulizia davvero
-        state
-            .release_session("client", 2, &["new/topic".to_string()])
-            .await;
+        state.release_session("client", 2, &filters).await;
         assert!(!state.sessions.read().await.contains_key("client"));
         assert!(state.trie.read().await.match_topic("new/topic").is_empty());
+    }
+
+    #[test]
+    fn test_apply_subscribe_mixed_valid_and_invalid() {
+        let mut trie = TopicTrie::new();
+        let mut filters = HashSet::new();
+        let topics = vec![
+            SubscribeTopic {
+                filter: "a/#/b".into(),
+                qos: QoS::AtMostOnce,
+            },
+            SubscribeTopic {
+                filter: "ok/+".into(),
+                qos: QoS::AtLeastOnce,
+            },
+            SubscribeTopic {
+                filter: "a+".into(),
+                qos: QoS::AtMostOnce,
+            },
+        ];
+
+        let codes = apply_subscribe(&mut trie, "c1", &topics, &mut filters);
+        assert_eq!(
+            codes,
+            vec![
+                SubAckReturnCode::Failure,
+                SubAckReturnCode::from(granted_qos(QoS::AtLeastOnce)),
+                SubAckReturnCode::Failure,
+            ]
+        );
+        assert_eq!(filters.len(), 1);
+        assert!(filters.contains("ok/+"));
+        assert_eq!(trie.match_topic("ok/temp").len(), 1);
+        assert!(trie.match_topic("a/x/b").is_empty());
+        assert!(trie.match_topic("a+").is_empty());
+    }
+
+    #[test]
+    fn test_apply_subscribe_deduplicates_filters() {
+        let mut trie = TopicTrie::new();
+        let mut filters = HashSet::new();
+        let topics = vec![SubscribeTopic {
+            filter: "sensors/+/temp".into(),
+            qos: QoS::AtMostOnce,
+        }];
+
+        for _ in 0..1000 {
+            let codes = apply_subscribe(&mut trie, "c1", &topics, &mut filters);
+            assert_eq!(codes, vec![SubAckReturnCode::SuccessQoS0]);
+        }
+
+        assert_eq!(filters.len(), 1);
+        assert!(filters.contains("sensors/+/temp"));
     }
 
     #[tokio::test]

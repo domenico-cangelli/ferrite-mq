@@ -531,3 +531,66 @@ async fn test_self_subscriber_flood_does_not_freeze_broker() {
         "il broker si è congelato durante il flood del self-subscriber"
     );
 }
+
+#[tokio::test]
+async fn test_subscribe_mixed_filters_returns_failure_and_keeps_connection_open() {
+    let broker_addr = start_test_broker().await;
+
+    let mut sub = raw_connect(broker_addr, "sub-mixed", 60).await;
+    sub.send(Packet::Subscribe {
+        packet_id: 10,
+        topics: vec![
+            ferrite_protocol::SubscribeTopic {
+                filter: "a/#/b".into(),
+                qos: QoS::AtMostOnce,
+            },
+            ferrite_protocol::SubscribeTopic {
+                filter: "ok/+".into(),
+                qos: QoS::AtLeastOnce,
+            },
+        ],
+    })
+    .await
+    .unwrap();
+
+    let response = timeout(Duration::from_secs(2), sub.next())
+        .await
+        .expect("Timeout waiting for SUBACK")
+        .expect("Connection closed after invalid filter")
+        .expect("Protocol error");
+
+    assert_eq!(
+        response,
+        Packet::SubAck {
+            packet_id: 10,
+            return_codes: vec![
+                ferrite_protocol::SubAckReturnCode::Failure,
+                ferrite_protocol::SubAckReturnCode::SuccessQoS0,
+            ],
+        }
+    );
+
+    // La connessione deve restare aperta e continuare a ricevere messaggi su "ok/+".
+    let (pub_client, _pub_rx) = connect(MqttOptions::new("pub-mixed", broker_addr))
+        .await
+        .unwrap();
+    pub_client
+        .publish("ok/hello", Bytes::from_static(b"alive"))
+        .await
+        .unwrap();
+
+    let received = timeout(Duration::from_secs(2), sub.next())
+        .await
+        .expect("Timeout waiting for PUBLISH on open connection")
+        .expect("Connection closed unexpectedly")
+        .expect("Protocol error");
+    match received {
+        Packet::Publish { topic, payload, .. } => {
+            assert_eq!(topic, "ok/hello");
+            assert_eq!(payload, Bytes::from_static(b"alive"));
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
+
+    pub_client.disconnect().await.unwrap();
+}
