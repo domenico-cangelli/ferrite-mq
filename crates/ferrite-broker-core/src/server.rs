@@ -464,11 +464,31 @@ async fn session_loop(
                         }
                     }
                     Some(Ok(Packet::Disconnect)) | None => return Ok(()),
+                    Some(Ok(Packet::Connect { .. })) => {
+                        warn!(
+                            "[{}] Received second CONNECT packet, protocol violation (MQTT-3.1.0-2), closing",
+                            client_id
+                        );
+                        return Ok(());
+                    }
+                    Some(Ok(
+                        packet @ (Packet::ConnAck { .. }
+                        | Packet::SubAck { .. }
+                        | Packet::PingResp),
+                    )) => {
+                        warn!(
+                            "[{}] Received server-only packet {:?}, protocol violation, closing",
+                            client_id, packet
+                        );
+                        return Ok(());
+                    }
+                    Some(Ok(Packet::PubAck { .. })) => {
+                        // Fase 2: gestione PUBACK dal subscriber per QoS 1 in uscita.
+                    }
                     Some(Err(e)) => {
                         warn!("Protocol error from [{}]: {:?}", client_id, e);
                         return Ok(());
                     }
-                    Some(Ok(_)) => {}
                 }
             }
         }

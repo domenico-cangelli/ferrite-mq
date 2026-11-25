@@ -791,3 +791,29 @@ async fn test_empty_client_id_with_clean_session_false_returns_connack_0x02_and_
         .expect("Timeout waiting for socket close after CONNACK 0x02");
     assert!(closed.is_none());
 }
+
+#[tokio::test]
+async fn test_second_connect_closes_connection() {
+    let broker_addr = start_test_broker().await;
+
+    let mut client = raw_connect(broker_addr, "second-connect-client", 60).await;
+
+    // Secondo CONNECT sulla stessa connessione: violazione MQTT-3.1.0-2.
+    client
+        .send(Packet::Connect {
+            protocol_version: ProtocolVersion::Mqtt311,
+            clean_session: true,
+            keep_alive: 60,
+            client_id: "second-connect-client".into(),
+            will: None,
+            username: None,
+            password: None,
+        })
+        .await
+        .unwrap();
+
+    let closed = timeout(Duration::from_secs(2), client.next())
+        .await
+        .expect("il broker non ha chiuso la connessione dopo un secondo CONNECT");
+    assert!(closed.is_none());
+}
