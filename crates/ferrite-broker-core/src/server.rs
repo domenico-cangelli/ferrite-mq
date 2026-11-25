@@ -107,6 +107,31 @@ async fn subscribe_if_owner(
     Some(apply_subscribe(&mut trie, client_id, topics, filters))
 }
 
+/// Rimuove le sottoscrizioni solo se `conn_id` è ancora la proprietaria corrente di
+/// `client_id`. Prende i lock nell'ordine fisso `trie` (write) -> `sessions` (read)
+/// e li rilascia prima di ritornare, senza mai fare I/O sotto lock.
+async fn unsubscribe_if_owner(
+    state: &BrokerState,
+    client_id: &str,
+    conn_id: u64,
+    filters_to_remove: &[String],
+    subscribed_filters: &mut HashSet<String>,
+) -> Option<()> {
+    let mut trie = state.trie.write().await;
+    let sessions = state.sessions.read().await;
+    let still_owner = sessions
+        .get(client_id)
+        .is_some_and(|session| session.conn_id == conn_id);
+    if !still_owner {
+        return None;
+    }
+    for filter in filters_to_remove {
+        trie.unsubscribe(filter, client_id);
+        subscribed_filters.remove(filter);
+    }
+    Some(())
+}
+
 /// Sessione attiva di un client: canale verso la sua connessione + identificativo
 /// univoco della *connessione* (non del client_id, che può essere riusato).
 pub struct SessionHandle {
@@ -419,6 +444,34 @@ async fn session_loop(
                         )
                         .await?;
                     }
+                    Some(Ok(Packet::Unsubscribe { packet_id, filters })) => {
+                        if filters.is_empty() {
+                            warn!(
+                                "[{}] Received UNSUBSCRIBE with empty filter list, protocol violation (MQTT-3.10.3-2)",
+                                client_id
+                            );
+                            return Ok(());
+                        }
+                        if unsubscribe_if_owner(
+                            state,
+                            client_id,
+                            conn_id,
+                            &filters,
+                            subscribed_filters,
+                        )
+                        .await
+                        .is_none()
+                        {
+                            info!(
+                                "Client [{}] session replaced before applying UNSUBSCRIBE, closing",
+                                client_id
+                            );
+                            return Ok(());
+                        }
+                        // MQTT-3.10.4-5: UNSUBACK sempre con lo stesso packet_id, anche se il filtro non esisteva.
+                        send_with_timeout(framed, Packet::UnsubAck { packet_id }, WRITE_TIMEOUT)
+                            .await?;
+                    }
                     Some(Ok(Packet::Publish {
                         topic,
                         qos,
@@ -522,6 +575,7 @@ async fn session_loop(
                     Some(Ok(
                         packet @ (Packet::ConnAck { .. }
                         | Packet::SubAck { .. }
+                        | Packet::UnsubAck { .. }
                         | Packet::PingResp),
                     )) => {
                         warn!(
@@ -744,5 +798,40 @@ mod tests {
         assert_eq!(res_new, Some(vec![SubAckReturnCode::SuccessQoS0]));
         assert_eq!(state.trie.read().await.match_topic("x/y").len(), 1);
         assert!(new_filters.contains("x/y"));
+    }
+
+    #[tokio::test]
+    async fn test_unsubscribe_if_owner_removes_for_owner_and_ignores_replaced() {
+        let state = BrokerState::default();
+        let (first, _first_rx) = handle(1);
+        let (second, _second_rx) = handle(2);
+        state.register_session("c", first).await;
+        state.register_session("c", second).await;
+
+        let topics = vec![SubscribeTopic {
+            filter: "x/y".into(),
+            qos: QoS::AtMostOnce,
+        }];
+        let mut new_filters = HashSet::new();
+        assert!(
+            subscribe_if_owner(&state, "c", 2, &topics, &mut new_filters)
+                .await
+                .is_some()
+        );
+        assert_eq!(state.trie.read().await.match_topic("x/y").len(), 1);
+
+        // Connessione sostituita (conn 1) riceve None e il trie non cambia.
+        let mut old_filters = HashSet::from(["x/y".to_string()]);
+        let res_old =
+            unsubscribe_if_owner(&state, "c", 1, &["x/y".to_string()], &mut old_filters).await;
+        assert!(res_old.is_none());
+        assert_eq!(state.trie.read().await.match_topic("x/y").len(), 1);
+
+        // Connessione proprietaria (conn 2) rimuove il filtro e il trie torna vuoto.
+        let res_new =
+            unsubscribe_if_owner(&state, "c", 2, &["x/y".to_string()], &mut new_filters).await;
+        assert_eq!(res_new, Some(()));
+        assert!(state.trie.read().await.match_topic("x/y").is_empty());
+        assert!(new_filters.is_empty());
     }
 }
