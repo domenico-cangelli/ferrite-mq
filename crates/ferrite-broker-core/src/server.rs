@@ -86,6 +86,17 @@ fn apply_subscribe(
         .collect()
 }
 
+async fn subscribe_if_owner(
+    state: &BrokerState,
+    client_id: &str,
+    _conn_id: u64,
+    topics: &[SubscribeTopic],
+    filters: &mut HashSet<String>,
+) -> Option<Vec<SubAckReturnCode>> {
+    let mut trie = state.trie.write().await;
+    Some(apply_subscribe(&mut trie, client_id, topics, filters))
+}
+
 /// Sessione attiva di un client: canale verso la sua connessione + identificativo
 /// univoco della *connessione* (non del client_id, che può essere riusato).
 pub struct SessionHandle {
@@ -679,5 +690,33 @@ mod tests {
             .expect("il broker non ha chiuso la socket muta dopo CONNECT_TIMEOUT");
         assert!(res.is_none());
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_if_owner_rejects_replaced_connection() {
+        let state = BrokerState::default();
+        let (first, _first_rx) = handle(1);
+        let (second, _second_rx) = handle(2);
+        state.register_session("c", first).await;
+        state.register_session("c", second).await;
+
+        let topics = vec![SubscribeTopic {
+            filter: "x/y".into(),
+            qos: QoS::AtMostOnce,
+        }];
+        let mut old_filters = HashSet::new();
+        let res_old = subscribe_if_owner(&state, "c", 1, &topics, &mut old_filters).await;
+        assert!(
+            res_old.is_none(),
+            "la connessione sostituita non deve poter iscriversi nel trie"
+        );
+        assert!(state.trie.read().await.match_topic("x/y").is_empty());
+        assert!(old_filters.is_empty());
+
+        let mut new_filters = HashSet::new();
+        let res_new = subscribe_if_owner(&state, "c", 2, &topics, &mut new_filters).await;
+        assert_eq!(res_new, Some(vec![SubAckReturnCode::SuccessQoS0]));
+        assert_eq!(state.trie.read().await.match_topic("x/y").len(), 1);
+        assert!(new_filters.contains("x/y"));
     }
 }
