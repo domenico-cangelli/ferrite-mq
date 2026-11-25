@@ -24,9 +24,9 @@ ferrite-protocol → ferrite-broker-core → ferrite-broker → ferrite-client �
   - `SUBSCRIBE`, `SUBACK`
   - `PINGREQ`, `PINGRESP`
   - `DISCONNECT`
-- [x] I pacchetti riconosciuti ma non ancora implementati (`PUBREC`, `PUBREL`, `PUBCOMP`, `UNSUBSCRIBE`, `UNSUBACK`, `AUTH`) producono un errore esplicito `InvalidPacketType` invece di sparire in silenzio.
+- [x] I pacchetti riconosciuti ma non ancora implementati (`PUBREC`, `PUBREL`, `PUBCOMP`, `AUTH`) producono un errore esplicito `InvalidPacketType` invece di sparire in silenzio.
 - [x] `QoS` ordinabile (`PartialOrd`/`Ord`) e `From<QoS> for SubAckReturnCode`.
-- [ ] `UNSUBSCRIBE` / `UNSUBACK` (encode/decode).
+- [x] `UNSUBSCRIBE` / `UNSUBACK` (encode/decode).
 
 ### `ferrite-broker-core`
 - [x] `TopicTrie`: albero di instradamento gerarchico in memoria.
@@ -185,7 +185,7 @@ Attualmente il broker recapita i messaggi ai subscriber con `packet_id: None` (c
 | ~~Finestra di race stretta: se un takeover avviene mentre la vecchia connessione elabora un `SUBSCRIBE`, può reiscrivere un filtro per il `client_id` ormai appartenente alla nuova.~~ | `broker-core/server.rs` | Risolto (issue #12: `biased;` nel `select!` + controllo proprietà sotto lock in `subscribe_if_owner`) |
 | `encode_string` tronca con `as u16` le stringhe più lunghe di 65535 byte invece di restituire un errore. | `protocol/codec.rs` | Prima di aprire il progetto al pubblico |
 | Il `Will` ricevuto nel `CONNECT` è decodificato ma il broker lo ignora. | `broker-core/server.rs` | Fase 4 |
-| Il broker non gestisce `UNSUBSCRIBE`: il trie ha `unsubscribe`, ma non è raggiungibile dalla rete. | `protocol`, `broker-core` | Prima della Fase 3 |
+| ~~Il broker non gestisce `UNSUBSCRIBE`: il trie ha `unsubscribe`, ma non è raggiungibile dalla rete.~~ | `protocol`, `broker-core` | Risolto (issue #9: `UNSUBSCRIBE`/`UNSUBACK` end-to-end in protocollo, broker e client) |
 
 
 ---
