@@ -397,6 +397,15 @@ async fn session_loop(
                             return Ok(());
                         }
 
+                        // TODO(Fase 5, #18): implementare handshake QoS 2 (PUBREC/PUBREL/PUBCOMP).
+                        if qos == QoS::ExactlyOnce {
+                            warn!(
+                                "[{}] QoS 2 non supportato (previsto in Fase 5), chiusura connessione",
+                                client_id
+                            );
+                            return Ok(());
+                        }
+
                         // 1. Regola QoS 1: se il messaggio ricevuto è AtLeastOnce,
                         // dobbiamo confermarne la ricezione al publisher inviando PUBACK con lo stesso ID.
                         if qos == QoS::AtLeastOnce {

@@ -932,3 +932,78 @@ async fn test_forwarded_publish_clears_retain_and_dup_from_qos1_publisher() {
 
     sub_client.disconnect().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_publish_qos2_closes_connection_and_does_not_deliver() {
+    let broker_addr = start_test_broker().await;
+
+    // Subscriber S iscritto a "t/q2"
+    let (sub_client, mut sub_rx) = connect(MqttOptions::new("sub-q2", broker_addr))
+        .await
+        .unwrap();
+    sub_client.subscribe("t/q2", QoS::AtMostOnce).await.unwrap();
+    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(suback, Packet::SubAck { .. }));
+
+    // Publisher P invia PUBLISH QoS 2 con packet_id = 1 su "t/q2"
+    let mut pub_q2 = raw_connect(broker_addr, "pub-q2", 60).await;
+    pub_q2
+        .send(Packet::Publish {
+            topic: "t/q2".into(),
+            qos: QoS::ExactlyOnce,
+            retain: false,
+            dup: false,
+            packet_id: Some(1),
+            payload: Bytes::from_static(b"qos2-not-supported"),
+        })
+        .await
+        .unwrap();
+
+    // La connessione di P deve essere chiusa entro 2 secondi (EOF o errore)
+    let closed = timeout(Duration::from_secs(2), pub_q2.next())
+        .await
+        .expect("il broker non ha chiuso la connessione dopo PUBLISH QoS 2");
+    assert!(
+        matches!(closed, None | Some(Err(_))),
+        "attesa chiusura connessione dopo PUBLISH QoS 2, ricevuto: {:?}",
+        closed
+    );
+
+    // S non deve ricevere nulla entro 500 ms
+    let nothing = timeout(Duration::from_millis(500), sub_rx.recv()).await;
+    assert!(
+        nothing.is_err(),
+        "il subscriber ha ricevuto un messaggio QoS 2 inatteso: {:?}",
+        nothing
+    );
+
+    // Un secondo publisher QoS 1 su "t/q2" deve continuare a funzionare
+    let (pub_q1, _pub_q1_rx) = connect(MqttOptions::new("pub-q1", broker_addr))
+        .await
+        .unwrap();
+    timeout(
+        Duration::from_secs(2),
+        pub_q1.publish_qos1("t/q2", Bytes::from_static(b"qos1-ok")),
+    )
+    .await
+    .expect("Timeout waiting for QoS 1 PUBACK")
+    .expect("publish_qos1 failed");
+
+    let received = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .expect("Timeout waiting for QoS 1 PUBLISH")
+        .expect("Channel closed");
+    match received {
+        Packet::Publish { topic, payload, .. } => {
+            assert_eq!(topic, "t/q2");
+            assert_eq!(payload, Bytes::from_static(b"qos1-ok"));
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
+
+    pub_q1.disconnect().await.unwrap();
+    sub_client.disconnect().await.unwrap();
+}
