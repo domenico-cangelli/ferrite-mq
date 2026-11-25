@@ -121,7 +121,7 @@ impl Decoder for MqttCodec {
             PacketType::Connect => {
                 let proto_name = Self::decode_string(&mut body)?;
                 if proto_name != "MQTT" {
-                    return Err(ProtocolError::InvalidPacketType(0));
+                    return Err(ProtocolError::InvalidProtocolName);
                 }
 
                 if body.remaining() < 1 {
@@ -141,16 +141,43 @@ impl Decoder for MqttCodec {
                 let connect_flags = body.get_u8();
                 let keep_alive = body.get_u16();
 
+                // MQTT-3.1.2-3: il bit 0 dei connect flags è riservato e deve essere 0.
+                if (connect_flags & 0x01) != 0 {
+                    return Err(ProtocolError::MalformedPacket("reserved connect flag"));
+                }
+
                 let clean_session = (connect_flags & 0x02) != 0;
                 let has_will = (connect_flags & 0x04) != 0;
+                let will_qos_raw = (connect_flags >> 3) & 0x03;
+                let will_retain = (connect_flags & 0x20) != 0;
                 let has_username = (connect_flags & 0x80) != 0;
                 let has_password = (connect_flags & 0x40) != 0;
+
+                // MQTT-3.1.2-11 / MQTT-3.1.2-15: senza Will Flag, Will QoS e Will Retain devono essere 0.
+                if !has_will && (will_qos_raw != 0 || will_retain) {
+                    return Err(ProtocolError::MalformedPacket(
+                        "will qos or retain set without will flag",
+                    ));
+                }
+
+                // MQTT-3.1.2-22: Password Flag = 1 richiede Username Flag = 1.
+                if has_password && !has_username {
+                    return Err(ProtocolError::MalformedPacket(
+                        "password flag set without username flag",
+                    ));
+                }
+
+                let will_qos = if has_will {
+                    Some(QoS::try_from(will_qos_raw)?)
+                } else {
+                    None
+                };
 
                 let client_id = Self::decode_string(&mut body)?;
 
                 // Will: topic + payload nel payload del CONNECT; QoS (bit 3-4) e retain (bit 5)
                 // stanno invece nei connect flags.
-                let will = if has_will {
+                let will = if let Some(qos) = will_qos {
                     let will_topic = Self::decode_string(&mut body)?;
                     if body.remaining() < 2 {
                         return Err(ProtocolError::MalformedPacket("truncated will payload"));
@@ -163,8 +190,8 @@ impl Decoder for MqttCodec {
                     Some(Will {
                         topic: will_topic,
                         payload: will_payload,
-                        qos: QoS::try_from((connect_flags >> 3) & 0x03)?,
-                        retain: (connect_flags & 0x20) != 0,
+                        qos,
+                        retain: will_retain,
                     })
                 } else {
                     None
@@ -1140,5 +1167,64 @@ mod tests {
         // SUBACK con codice non valido alla fine / corpo vuoto
         let mut suback_bad = BytesMut::from(&[0x90, 0x04, 0x00, 0x01, 0x00, 0x7F][..]);
         assert!(codec.decode(&mut suback_bad).is_err());
+    }
+
+    #[test]
+    fn test_connect_flags_and_protocol_name_validation() {
+        let mut codec = MqttCodec::default();
+
+        // Helper: costruisce un CONNECT minimo con connect_flags personalizzati.
+        let make_connect = |flags: u8| -> BytesMut {
+            BytesMut::from(
+                &[
+                    0x10, 0x0C, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, flags, 0x00, 0x3C, 0x00,
+                    0x00,
+                ][..],
+            )
+        };
+
+        // (a) Bit riservato a 1 (0x01) -> MalformedPacket("reserved connect flag")
+        let mut buf = make_connect(0x03);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(ProtocolError::MalformedPacket("reserved connect flag"))
+        ));
+
+        // (b) Will Flag = 0 con Will QoS != 0 (0x08) o Will Retain = 1 (0x20)
+        let mut buf = make_connect(0x02 | 0x08);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(ProtocolError::MalformedPacket(_))
+        ));
+        let mut buf = make_connect(0x02 | 0x20);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(ProtocolError::MalformedPacket(_))
+        ));
+
+        // (c) Password Flag = 1 senza Username Flag (0x40)
+        let mut buf = make_connect(0x02 | 0x40);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(ProtocolError::MalformedPacket(_))
+        ));
+
+        // (d) Nome protocollo diverso da "MQTT" -> InvalidProtocolName
+        let mut buf_proto = BytesMut::from(
+            &[
+                0x10, 0x0C, 0x00, 0x04, b'H', b'T', b'T', b'P', 0x04, 0x02, 0x00, 0x3C, 0x00, 0x00,
+            ][..],
+        );
+        assert!(matches!(
+            codec.decode(&mut buf_proto),
+            Err(ProtocolError::InvalidProtocolName)
+        ));
+
+        // (e) Will Flag = 1 con Will QoS = 3 (0x04 | 0x18) -> InvalidQoS(3)
+        let mut buf = make_connect(0x02 | 0x04 | 0x18);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(ProtocolError::InvalidQoS(3))
+        ));
     }
 }
