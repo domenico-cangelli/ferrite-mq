@@ -42,17 +42,17 @@ pub struct AsyncClient {
 
 /// Restituisce il prossimo Packet ID MQTT, nell'intervallo [1, 65535].
 ///
-/// Usa `fetch_update` (compare-and-swap in un ciclo) così lettura e aggiornamento
+/// Usa `try_update` (compare-and-swap in un ciclo) così lettura e aggiornamento
 /// del contatore sono un'unica operazione atomica: due thread concorrenti non
 /// possono mai ottenere lo stesso ID, e il valore 0 (invalido in MQTT) non viene
 /// mai memorizzato nel contatore, quindi non può mai essere restituito.
 fn next_id(counter: &AtomicU16) -> u16 {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             // Dopo 65535 si riparte da 1, saltando lo 0.
             Some(if current == u16::MAX { 1 } else { current + 1 })
         })
-        // La closure ritorna sempre Some, quindi fetch_update non può fallire.
+        // La closure ritorna sempre Some, quindi try_update non può fallire.
         // Il valore restituito è quello *precedente*, cioè l'ID da usare.
         .expect("la closure restituisce sempre Some")
 }
@@ -315,6 +315,22 @@ mod tests {
         for _ in 0..(u16::MAX as u32 * 2) {
             assert_ne!(next_id(&counter), 0);
         }
+    }
+
+    #[test]
+    fn test_next_id_full_cycle_returns_to_one_without_zero() {
+        let counter = AtomicU16::new(1);
+        let first = next_id(&counter);
+        assert_eq!(first, 1);
+
+        for expected in 2..=u16::MAX {
+            let id = next_id(&counter);
+            assert_ne!(id, 0);
+            assert_eq!(id, expected);
+        }
+
+        // Dopo 65535 chiamate, l'ID successivo torna a 1 saltando 0.
+        assert_eq!(next_id(&counter), 1);
     }
 
     #[test]
