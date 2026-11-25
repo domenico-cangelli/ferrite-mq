@@ -658,23 +658,17 @@ async fn test_publish_invalid_topic_closes_connection_and_does_not_deliver() {
 
 #[tokio::test]
 async fn test_connect_protocol_level_5_receives_connack_0x01_and_closes() {
+    use tokio::io::AsyncWriteExt;
+
     let broker_addr = start_test_broker().await;
 
-    let stream = tokio::net::TcpStream::connect(broker_addr).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(broker_addr).await.unwrap();
+    // Byte grezzi di un CONNECT MQTT 5.0 (livello 5): il nostro encoder rifiuta Mqtt50.
+    let raw_v5_connect = [
+        0x10, 0x0C, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x3C, 0x00, 0x00,
+    ];
+    stream.write_all(&raw_v5_connect).await.unwrap();
     let mut framed = Framed::new(stream, MqttCodec::default());
-
-    framed
-        .send(Packet::Connect {
-            protocol_version: ProtocolVersion::Mqtt50,
-            clean_session: true,
-            keep_alive: 60,
-            client_id: "mqtt5-client".into(),
-            will: None,
-            username: None,
-            password: None,
-        })
-        .await
-        .unwrap();
 
     let response = timeout(Duration::from_secs(2), framed.next())
         .await

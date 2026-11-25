@@ -439,6 +439,12 @@ impl Encoder<Packet> for MqttCodec {
                 username,
                 password,
             } => {
+                if protocol_version != ProtocolVersion::Mqtt311 {
+                    return Err(ProtocolError::UnsupportedProtocolLevel(
+                        protocol_version as u8,
+                    ));
+                }
+
                 let mut body = BytesMut::new();
 
                 // Protocol Name ("MQTT")
@@ -879,22 +885,12 @@ mod tests {
     fn test_connect_unsupported_protocol_level_3_and_5() {
         let mut codec = MqttCodec::default();
 
-        // Livello 5 (MQTT 5.0)
-        let mut buf_v5 = BytesMut::new();
-        codec
-            .encode(
-                Packet::Connect {
-                    protocol_version: ProtocolVersion::Mqtt50,
-                    clean_session: true,
-                    keep_alive: 60,
-                    client_id: "c-v5".to_string(),
-                    will: None,
-                    username: None,
-                    password: None,
-                },
-                &mut buf_v5,
-            )
-            .unwrap();
+        // Livello 5 (MQTT 5.0) costruito in byte grezzi (l'encoder rifiuta Mqtt50)
+        let mut buf_v5 = BytesMut::from(
+            &[
+                0x10, 0x0C, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x3C, 0x00, 0x00,
+            ][..],
+        );
         assert!(matches!(
             codec.decode(&mut buf_v5),
             Err(ProtocolError::UnsupportedProtocolLevel(5))
@@ -1352,6 +1348,32 @@ mod tests {
         assert!(matches!(
             res,
             Err(ProtocolError::MalformedPacket("missing packet id"))
+        ));
+        assert_eq!(&dst[..], initial_prefix);
+    }
+
+    #[test]
+    fn test_encode_connect_mqtt50_rejected_without_writing() {
+        let mut codec = MqttCodec::default();
+        let initial_prefix = b"untouched";
+        let mut dst = BytesMut::from(&initial_prefix[..]);
+
+        let res = codec.encode(
+            Packet::Connect {
+                protocol_version: ProtocolVersion::Mqtt50,
+                clean_session: true,
+                keep_alive: 60,
+                client_id: "c-v5".into(),
+                will: None,
+                username: None,
+                password: None,
+            },
+            &mut dst,
+        );
+
+        assert!(matches!(
+            res,
+            Err(ProtocolError::UnsupportedProtocolLevel(5))
         ));
         assert_eq!(&dst[..], initial_prefix);
     }
