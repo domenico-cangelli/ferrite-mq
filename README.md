@@ -1,5 +1,7 @@
 # FerriteMQ
 
+[![CI](https://github.com/domenico-cangelli/ferrite-mq/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/domenico-cangelli/ferrite-mq/actions/workflows/ci.yml)
+
 An MQTT 3.1.1 suite written in Rust: protocol codec, broker and async client, built on [Tokio](https://tokio.rs).
 
 > **Status: early development.** Not ready for production. The APIs will change.
