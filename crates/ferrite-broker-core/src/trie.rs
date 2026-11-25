@@ -1,5 +1,84 @@
 use ferrite_protocol::QoS;
 use std::collections::HashMap;
+use std::fmt;
+use tracing::warn;
+
+const MAX_FILTER_BYTES: usize = 65535;
+const MAX_FILTER_LEVELS: usize = 64;
+
+/// Errore di validazione di un MQTT Topic Filter (MQTT-4.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilterError {
+    Empty,
+    TooLong,
+    TooDeep,
+    InvalidHash,
+    InvalidPlus,
+    NulChar,
+}
+
+impl fmt::Display for FilterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FilterError::Empty => write!(f, "topic filter cannot be empty"),
+            FilterError::TooLong => {
+                write!(
+                    f,
+                    "topic filter exceeds maximum length of {MAX_FILTER_BYTES} bytes"
+                )
+            }
+            FilterError::TooDeep => {
+                write!(
+                    f,
+                    "topic filter exceeds maximum depth of {MAX_FILTER_LEVELS} levels"
+                )
+            }
+            FilterError::InvalidHash => {
+                write!(
+                    f,
+                    "'#' wildcard must occupy an entire level and be the last level"
+                )
+            }
+            FilterError::InvalidPlus => {
+                write!(f, "'+' wildcard must occupy an entire level")
+            }
+            FilterError::NulChar => write!(f, "topic filter cannot contain NUL (U+0000)"),
+        }
+    }
+}
+
+impl std::error::Error for FilterError {}
+
+/// Valida un MQTT Topic Filter secondo le regole MQTT 3.1.1 (sezione 4.7) e i limiti del broker.
+pub fn validate_filter(filter: &str) -> Result<(), FilterError> {
+    if filter.is_empty() {
+        return Err(FilterError::Empty);
+    }
+
+    let mut levels = 0usize;
+    let mut iter = filter.split('/').peekable();
+    while let Some(token) = iter.next() {
+        levels += 1;
+        if levels > MAX_FILTER_LEVELS {
+            return Err(FilterError::TooDeep);
+        }
+        if token.contains('\0') {
+            return Err(FilterError::NulChar);
+        }
+        if token.contains('#') && (token != "#" || iter.peek().is_some()) {
+            return Err(FilterError::InvalidHash);
+        }
+        if token.contains('+') && token != "+" {
+            return Err(FilterError::InvalidPlus);
+        }
+    }
+
+    if filter.len() > MAX_FILTER_BYTES {
+        return Err(FilterError::TooLong);
+    }
+
+    Ok(())
+}
 
 /// Rappresenta una sottoscrizione effettuata da un client a un topic filter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -33,8 +112,15 @@ impl TopicTrie {
         }
     }
 
-    /// Inserisce un filtro di sottoscrizione (es. "sensors/+/temperature") per un dato client.
-    pub fn subscribe(&mut self, topic_filter: &str, client_id: String, qos: QoS) {
+    /// Inserisce un filtro di sottoscrizione validato nel trie.
+    pub fn try_subscribe(
+        &mut self,
+        topic_filter: &str,
+        client_id: String,
+        qos: QoS,
+    ) -> Result<(), FilterError> {
+        validate_filter(topic_filter)?;
+
         let tokens: Vec<&str> = topic_filter.split('/').collect();
         let mut current = &mut self.root;
 
@@ -42,7 +128,7 @@ impl TopicTrie {
             if token == "#" {
                 // '#' deve essere l'ultimo carattere del filtro
                 current.hash_subscribers.insert(client_id, qos);
-                return;
+                return Ok(());
             } else if token == "+" {
                 if current.plus_child.is_none() {
                     current.plus_child = Some(Box::new(TrieNode::default()));
@@ -56,6 +142,16 @@ impl TopicTrie {
             if idx == tokens.len() - 1 {
                 current.subscribers.insert(client_id.clone(), qos);
             }
+        }
+
+        Ok(())
+    }
+
+    /// Inserisce un filtro di sottoscrizione (es. "sensors/+/temperature") per un dato client.
+    /// Se il filtro è invalido non inserisce nulla e registra un `warn!`.
+    pub fn subscribe(&mut self, topic_filter: &str, client_id: String, qos: QoS) {
+        if let Err(err) = self.try_subscribe(topic_filter, client_id, qos) {
+            warn!("Ignoring invalid topic filter {:?}: {}", topic_filter, err);
         }
     }
     /// Rimuove la sottoscrizione di un client a uno specifico topic filter.
@@ -239,5 +335,57 @@ mod tests {
         assert_eq!(matches[0].client_id, "stays");
         assert!(trie.match_topic("a/z/c").is_empty());
         assert!(trie.match_topic("x/y/z").is_empty());
+    }
+
+    #[test]
+    fn test_validate_filter_valid_cases() {
+        for filter in ["#", "+", "a/b", "a/+/c", "a/#", "/a", "a/", "+/+"] {
+            assert_eq!(
+                validate_filter(filter),
+                Ok(()),
+                "filtro valido rifiutato: {filter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_filter_error_variants() {
+        assert_eq!(validate_filter(""), Err(FilterError::Empty));
+        assert_eq!(
+            validate_filter(&"a".repeat(MAX_FILTER_BYTES + 1)),
+            Err(FilterError::TooLong)
+        );
+        assert_eq!(
+            validate_filter(&vec!["a"; MAX_FILTER_LEVELS + 1].join("/")),
+            Err(FilterError::TooDeep)
+        );
+        assert_eq!(validate_filter("a/#/b"), Err(FilterError::InvalidHash));
+        assert_eq!(validate_filter("a#"), Err(FilterError::InvalidHash));
+        assert_eq!(validate_filter("#a"), Err(FilterError::InvalidHash));
+        assert_eq!(validate_filter("a+"), Err(FilterError::InvalidPlus));
+        assert_eq!(validate_filter("+a"), Err(FilterError::InvalidPlus));
+        assert_eq!(validate_filter("a/\0/b"), Err(FilterError::NulChar));
+    }
+
+    #[test]
+    fn test_depth_limit_64_valid_and_100000_rejected() {
+        let mut trie = TopicTrie::new();
+
+        // 64 livelli: valido, inseribile, matchabile e rimovibile senza crash.
+        let max_valid = vec!["a"; MAX_FILTER_LEVELS].join("/");
+        assert_eq!(
+            trie.try_subscribe(&max_valid, "c1".into(), QoS::AtMostOnce),
+            Ok(())
+        );
+        assert_eq!(trie.match_topic(&max_valid).len(), 1);
+        trie.unsubscribe(&max_valid, "c1");
+        assert!(trie.match_topic(&max_valid).is_empty());
+
+        // 100000 livelli: rifiutato subito con TooDeep senza crash.
+        let deep = "a/".repeat(100_000);
+        assert_eq!(
+            trie.try_subscribe(&deep, "c2".into(), QoS::AtMostOnce),
+            Err(FilterError::TooDeep)
+        );
     }
 }
