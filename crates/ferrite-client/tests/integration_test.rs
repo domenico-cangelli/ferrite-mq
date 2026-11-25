@@ -817,3 +817,118 @@ async fn test_second_connect_closes_connection() {
         .expect("il broker non ha chiuso la connessione dopo un secondo CONNECT");
     assert!(closed.is_none());
 }
+
+#[tokio::test]
+async fn test_forwarded_publish_clears_retain_and_dup_from_qos0_publisher() {
+    let broker_addr = start_test_broker().await;
+
+    let (sub_client, mut sub_rx) = connect(MqttOptions::new("sub-retain-qos0", broker_addr))
+        .await
+        .unwrap();
+    sub_client.subscribe("t/x", QoS::AtMostOnce).await.unwrap();
+    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(suback, Packet::SubAck { .. }));
+
+    let mut pub_raw = raw_connect(broker_addr, "pub-retain-qos0", 60).await;
+    pub_raw
+        .send(Packet::Publish {
+            topic: "t/x".into(),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            dup: true,
+            packet_id: None,
+            payload: Bytes::from_static(b"hello"),
+        })
+        .await
+        .unwrap();
+
+    let received = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .expect("Timeout waiting for forwarded PUBLISH")
+        .expect("Channel closed");
+    match received {
+        Packet::Publish {
+            topic,
+            retain,
+            dup,
+            payload,
+            ..
+        } => {
+            assert_eq!(topic, "t/x");
+            assert_eq!(payload, Bytes::from_static(b"hello"));
+            assert!(
+                !retain,
+                "RETAIN deve essere false nell'inoltro (MQTT-3.3.1-9)"
+            );
+            assert!(!dup, "DUP deve essere false nell'inoltro (MQTT-3.3.1-2)");
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
+
+    sub_client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_forwarded_publish_clears_retain_and_dup_from_qos1_publisher() {
+    let broker_addr = start_test_broker().await;
+
+    let (sub_client, mut sub_rx) = connect(MqttOptions::new("sub-retain-qos1", broker_addr))
+        .await
+        .unwrap();
+    sub_client.subscribe("t/x", QoS::AtLeastOnce).await.unwrap();
+    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(suback, Packet::SubAck { .. }));
+
+    let mut pub_raw = raw_connect(broker_addr, "pub-retain-qos1", 60).await;
+    pub_raw
+        .send(Packet::Publish {
+            topic: "t/x".into(),
+            qos: QoS::AtLeastOnce,
+            retain: true,
+            dup: true,
+            packet_id: Some(1),
+            payload: Bytes::from_static(b"hello-qos1"),
+        })
+        .await
+        .unwrap();
+
+    let puback = timeout(Duration::from_secs(2), pub_raw.next())
+        .await
+        .expect("Timeout waiting for PUBACK")
+        .expect("Connection closed")
+        .expect("Protocol error");
+    assert_eq!(puback, Packet::PubAck { packet_id: 1 });
+
+    let received = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .expect("Timeout waiting for forwarded PUBLISH")
+        .expect("Channel closed");
+    match received {
+        Packet::Publish {
+            topic,
+            qos,
+            retain,
+            dup,
+            payload,
+            ..
+        } => {
+            assert_eq!(topic, "t/x");
+            assert_eq!(payload, Bytes::from_static(b"hello-qos1"));
+            assert_eq!(qos, QoS::AtMostOnce);
+            assert!(
+                !retain,
+                "RETAIN deve essere false nell'inoltro (MQTT-3.3.1-9)"
+            );
+            assert!(!dup, "DUP deve essere false nell'inoltro (MQTT-3.3.1-2)");
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
+
+    sub_client.disconnect().await.unwrap();
+}
