@@ -29,4 +29,16 @@ pub enum ProtocolError {
 
     #[error("Unsupported MQTT protocol level: {0}")]
     UnsupportedProtocolLevel(u8),
+
+    #[error("Malformed MQTT packet: {0}")]
+    MalformedPacket(&'static str),
+
+    #[error("Invalid fixed header flags {flags:#04x} for packet type {packet_type}")]
+    InvalidFixedHeaderFlags { packet_type: u8, flags: u8 },
+
+    #[error("Invalid MQTT protocol name")]
+    InvalidProtocolName,
+
+    #[error("String or binary field length {0} exceeds MQTT 65535-byte limit")]
+    StringTooLong(usize),
 }

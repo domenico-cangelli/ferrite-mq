@@ -76,6 +76,39 @@ impl Decoder for MqttCodec {
 
         src.advance(fixed_header_len);
         let mut body = src.split_to(remaining_length);
+        let flags = first_byte & 0x0F;
+
+        // MQTT-2.2.2-2: verifica dei flag riservati del fixed header per ogni tipo di pacchetto.
+        match packet_type {
+            PacketType::Connect
+            | PacketType::ConnAck
+            | PacketType::PubAck
+            | PacketType::SubAck
+            | PacketType::UnsubAck
+            | PacketType::PingReq
+            | PacketType::PingResp
+            | PacketType::Disconnect => {
+                if flags != 0x00 {
+                    return Err(ProtocolError::InvalidFixedHeaderFlags {
+                        packet_type: packet_type as u8,
+                        flags,
+                    });
+                }
+            }
+            PacketType::Subscribe | PacketType::Unsubscribe => {
+                if flags != 0x02 {
+                    return Err(ProtocolError::InvalidFixedHeaderFlags {
+                        packet_type: packet_type as u8,
+                        flags,
+                    });
+                }
+            }
+            PacketType::Publish
+            | PacketType::PubRec
+            | PacketType::PubRel
+            | PacketType::PubComp
+            | PacketType::Auth => {}
+        }
 
         match packet_type {
             PacketType::Connect => {
@@ -179,7 +212,6 @@ impl Decoder for MqttCodec {
             PacketType::Disconnect => Ok(Some(Packet::Disconnect)),
 
             PacketType::Publish => {
-                let flags = first_byte & 0x0F;
                 let dup = (flags & 0x08) != 0;
                 let qos_val = (flags >> 1) & 0x03;
                 let retain = (flags & 0x01) != 0;
@@ -187,7 +219,10 @@ impl Decoder for MqttCodec {
 
                 // MQTT-3.3.1-2: il flag DUP deve essere 0 per tutti i PUBLISH QoS 0.
                 if qos == QoS::AtMostOnce && dup {
-                    return Err(ProtocolError::InvalidPacketType(first_byte));
+                    return Err(ProtocolError::InvalidFixedHeaderFlags {
+                        packet_type: packet_type as u8,
+                        flags,
+                    });
                 }
 
                 let topic = Self::decode_string(&mut body)?;
@@ -281,10 +316,6 @@ impl Decoder for MqttCodec {
             }
 
             PacketType::Unsubscribe => {
-                // MQTT-3.10.1-1: i bit 3..0 del fixed header di UNSUBSCRIBE devono essere 0010 (0x02).
-                if (first_byte & 0x0F) != 0x02 {
-                    return Err(ProtocolError::InvalidPacketType(first_byte));
-                }
                 if body.remaining() < 2 {
                     return Err(ProtocolError::Incomplete);
                 }
@@ -306,10 +337,6 @@ impl Decoder for MqttCodec {
             }
 
             PacketType::UnsubAck => {
-                // I bit 3..0 del fixed header di UNSUBACK devono essere 0000 e il corpo esattamente 2 byte.
-                if (first_byte & 0x0F) != 0x00 {
-                    return Err(ProtocolError::InvalidPacketType(first_byte));
-                }
                 if body.remaining() < 2 {
                     return Err(ProtocolError::Incomplete);
                 }
@@ -841,7 +868,13 @@ mod tests {
             .unwrap();
 
         let result = codec.decode(&mut buffer);
-        assert!(matches!(result, Err(ProtocolError::InvalidPacketType(_))));
+        assert!(matches!(
+            result,
+            Err(ProtocolError::InvalidFixedHeaderFlags {
+                packet_type: 3,
+                flags: 0x08
+            })
+        ));
         assert!(buffer.is_empty());
     }
 
@@ -886,14 +919,20 @@ mod tests {
         let mut buf = BytesMut::from(&[0xA0, 0x05, 0x00, 0x01, 0x00, 0x01, b'a'][..]);
         assert!(matches!(
             codec.decode(&mut buf),
-            Err(ProtocolError::InvalidPacketType(0xA0))
+            Err(ProtocolError::InvalidFixedHeaderFlags {
+                packet_type: 10,
+                flags: 0x00
+            })
         ));
 
         // UNSUBACK flag sbagliati (0xB1 invece di 0xB0)
         let mut buf = BytesMut::from(&[0xB1, 0x02, 0x00, 0x01][..]);
         assert!(matches!(
             codec.decode(&mut buf),
-            Err(ProtocolError::InvalidPacketType(0xB1))
+            Err(ProtocolError::InvalidFixedHeaderFlags {
+                packet_type: 11,
+                flags: 0x01
+            })
         ));
 
         // UNSUBSCRIBE con zero filtri (MQTT-3.10.3-2)
@@ -951,5 +990,62 @@ mod tests {
             Some(Packet::UnsubAck { packet_id: 9 })
         );
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_fixed_header_flags_validation_for_all_packet_types() {
+        let mut codec = MqttCodec::default();
+
+        // Tipi che richiedono flag 0b0000: CONNECT(1), CONNACK(2), PUBACK(4),
+        // SUBACK(9), UNSUBACK(11), PINGREQ(12), PINGRESP(13), DISCONNECT(14).
+        let zero_flag_packets: &[(u8, &[u8])] = &[
+            (1, &[0x11, 0x00]),
+            (2, &[0x21, 0x02, 0x00, 0x00]),
+            (4, &[0x41, 0x02, 0x00, 0x01]),
+            (9, &[0x91, 0x03, 0x00, 0x01, 0x00]),
+            (11, &[0xB1, 0x02, 0x00, 0x01]),
+            (12, &[0xC1, 0x00]),
+            (13, &[0xD1, 0x00]),
+            (14, &[0xE1, 0x00]),
+        ];
+        for &(expected_type, raw) in zero_flag_packets {
+            let mut buf = BytesMut::from(raw);
+            assert!(
+                matches!(
+                    codec.decode(&mut buf),
+                    Err(ProtocolError::InvalidFixedHeaderFlags {
+                        packet_type,
+                        flags: 0x01
+                    }) if packet_type == expected_type
+                ),
+                "atteso InvalidFixedHeaderFlags per tipo {expected_type}"
+            );
+        }
+
+        // Tipi che richiedono flag 0b0010: SUBSCRIBE(8) e UNSUBSCRIBE(10).
+        let two_flag_packets: &[(u8, &[u8])] = &[
+            (8, &[0x80, 0x06, 0x00, 0x01, 0x00, 0x01, b'a', 0x00]),
+            (10, &[0xA0, 0x05, 0x00, 0x01, 0x00, 0x01, b'a']),
+        ];
+        for &(expected_type, raw) in two_flag_packets {
+            let mut buf = BytesMut::from(raw);
+            assert!(
+                matches!(
+                    codec.decode(&mut buf),
+                    Err(ProtocolError::InvalidFixedHeaderFlags {
+                        packet_type,
+                        flags: 0x00
+                    }) if packet_type == expected_type
+                ),
+                "atteso InvalidFixedHeaderFlags per tipo {expected_type}"
+            );
+        }
+
+        // PUBLISH QoS 3 (bits 2..1 = 0b11 -> 0x36)
+        let mut buf_qos3 = BytesMut::from(&[0x36, 0x03, 0x00, 0x01, b'a'][..]);
+        assert!(matches!(
+            codec.decode(&mut buf_qos3),
+            Err(ProtocolError::InvalidQoS(3))
+        ));
     }
 }
