@@ -443,3 +443,91 @@ async fn test_duplicate_client_id_disconnects_old_connection() {
         other => panic!("Expected Publish, got {:?}", other),
     }
 }
+
+#[tokio::test]
+async fn test_self_subscriber_flood_does_not_freeze_broker() {
+    let broker_addr = start_test_broker().await;
+
+    // Client A: socket TCP grezzo, CONNECT + SUBSCRIBE "#"
+    let mut client_a = raw_connect(broker_addr, "flood-client-a", 60).await;
+    client_a
+        .send(Packet::Subscribe {
+            packet_id: 1,
+            topics: vec![ferrite_protocol::SubscribeTopic {
+                filter: "#".into(),
+                qos: QoS::AtMostOnce,
+            }],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        client_a.next().await.unwrap().unwrap(),
+        Packet::SubAck { .. }
+    ));
+
+    // Client A invia 500 PUBLISH QoS 0 senza mai leggere dal socket.
+    // Lo eseguiamo in un task separato così anche se il buffer TCP di A si riempie
+    // il test prosegue e verifica che il broker risponda agli altri client.
+    let flood_payload = Bytes::from(vec![b'a'; 2048]);
+    let flood_task = tokio::spawn(async move {
+        for i in 0..500u32 {
+            let packet = Packet::Publish {
+                topic: format!("flood/{i}"),
+                qos: QoS::AtMostOnce,
+                retain: false,
+                dup: false,
+                packet_id: None,
+                payload: flood_payload.clone(),
+            };
+            if client_a.feed(packet).await.is_err() {
+                break;
+            }
+        }
+        let _ = client_a.flush().await;
+        // Manteniamo il socket aperto senza leggere finché il task non viene abortito.
+        std::future::pending::<()>().await;
+    });
+
+    // Diamo al flood il tempo di saturare il canale interno di A.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Client B e C devono riuscire a connettersi, iscriversi e scambiare messaggi entro 3 secondi.
+    let healthy_flow = timeout(Duration::from_secs(3), async {
+        let (client_c, mut rx_c) = connect(MqttOptions::new("healthy-client-c", broker_addr))
+            .await
+            .expect("client C failed to connect");
+        client_c
+            .subscribe("health/check", QoS::AtMostOnce)
+            .await
+            .expect("client C failed to subscribe");
+        let suback = rx_c.recv().await.expect("client C channel closed");
+        assert!(matches!(suback, Packet::SubAck { .. }));
+
+        let (client_b, _rx_b) = connect(MqttOptions::new("healthy-client-b", broker_addr))
+            .await
+            .expect("client B failed to connect");
+        client_b
+            .publish("health/check", Bytes::from_static(b"ok"))
+            .await
+            .expect("client B failed to publish");
+
+        let received = rx_c.recv().await.expect("client C channel closed");
+        match received {
+            Packet::Publish { topic, payload, .. } => {
+                assert_eq!(topic, "health/check");
+                assert_eq!(payload, Bytes::from_static(b"ok"));
+            }
+            other => panic!("Expected Publish, got {:?}", other),
+        }
+
+        client_b.disconnect().await.unwrap();
+        client_c.disconnect().await.unwrap();
+    })
+    .await;
+
+    flood_task.abort();
+    assert!(
+        healthy_flow.is_ok(),
+        "il broker si è congelato durante il flood del self-subscriber"
+    );
+}
