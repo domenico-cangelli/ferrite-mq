@@ -26,7 +26,7 @@ pub fn decode_varint<B: Buf + Clone>(buf: &mut B) -> Result<Option<(usize, usize
         value += ((encoded_byte & 0x7F) as usize) * multiplier;
 
         if multiplier > 128 * 128 * 128 {
-            return Err(ProtocolError::MalformedRemainingLength)
+            return Err(ProtocolError::MalformedRemainingLength);
         }
 
         multiplier *= 128;
@@ -108,8 +108,8 @@ mod tests {
 
         // Sostituisci assert_eq! con assert!(matches!(...))
         assert!(matches!(
-        decode_varint(&mut buf),
-        Err(ProtocolError::MalformedRemainingLength)
-    ));
+            decode_varint(&mut buf),
+            Err(ProtocolError::MalformedRemainingLength)
+        ));
     }
 }

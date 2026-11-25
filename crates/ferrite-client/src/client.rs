@@ -167,9 +167,9 @@ pub async fn connect(
 
     match framed.next().await {
         Some(Ok(Packet::ConnAck {
-                    return_code: ConnectReturnCode::Accepted,
-                    ..
-                })) => {}
+            return_code: ConnectReturnCode::Accepted,
+            ..
+        })) => {}
         Some(Ok(Packet::ConnAck { return_code, .. })) => {
             return Err(ClientError::ConnectionRefused(return_code));
         }
