@@ -100,6 +100,27 @@ pub struct TrieNode {
     hash_subscribers: HashMap<String, QoS>,
 }
 
+impl TrieNode {
+    fn is_empty(&self) -> bool {
+        self.subscribers.is_empty()
+            && self.children.is_empty()
+            && self.plus_child.is_none()
+            && self.hash_subscribers.is_empty()
+    }
+
+    #[cfg(test)]
+    fn node_count(&self) -> usize {
+        let mut count = 1;
+        for child in self.children.values() {
+            count += child.node_count();
+        }
+        if let Some(plus) = self.plus_child.as_deref() {
+            count += plus.node_count();
+        }
+        count
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct TopicTrie {
     root: TrieNode,
@@ -166,21 +187,23 @@ impl TopicTrie {
             if token == "#" {
                 node.hash_subscribers.remove(client_id);
             } else if token == "+" {
-                if let Some(plus) = node.plus_child.as_deref_mut() {
-                    Self::remove_recursive(plus, tokens, idx + 1, client_id);
+                let prune_plus = node
+                    .plus_child
+                    .as_deref_mut()
+                    .is_some_and(|plus| Self::remove_recursive(plus, tokens, idx + 1, client_id));
+                if prune_plus {
+                    node.plus_child = None;
                 }
             } else if let Some(child) = node.children.get_mut(token) {
-                Self::remove_recursive(child, tokens, idx + 1, client_id);
+                if Self::remove_recursive(child, tokens, idx + 1, client_id) {
+                    node.children.remove(token);
+                }
             }
         } else {
             node.subscribers.remove(client_id);
         }
 
-        // Cleanup: i rami vuoti possono essere potati (ottimizzazione futura)
-        node.subscribers.is_empty()
-            && node.children.is_empty()
-            && node.plus_child.is_none()
-            && node.hash_subscribers.is_empty()
+        node.is_empty()
     }
 
     /// Rimuove *tutte* le sottoscrizioni di un client, senza conoscere i suoi filtri.
@@ -192,15 +215,22 @@ impl TopicTrie {
         Self::remove_client_recursive(&mut self.root, client_id);
     }
 
-    fn remove_client_recursive(node: &mut TrieNode, client_id: &str) {
+    fn remove_client_recursive(node: &mut TrieNode, client_id: &str) -> bool {
         node.subscribers.remove(client_id);
         node.hash_subscribers.remove(client_id);
-        for child in node.children.values_mut() {
-            Self::remove_client_recursive(child, client_id);
-        }
+        node.children
+            .retain(|_, child| !Self::remove_client_recursive(child, client_id));
         if let Some(plus) = node.plus_child.as_deref_mut() {
-            Self::remove_client_recursive(plus, client_id);
+            if Self::remove_client_recursive(plus, client_id) {
+                node.plus_child = None;
+            }
         }
+        node.is_empty()
+    }
+
+    #[cfg(test)]
+    fn node_count(&self) -> usize {
+        self.root.node_count()
     }
 
     /// Trova tutti i client a cui recapitare un messaggio pubblicato su un topic concreto.
@@ -387,5 +417,48 @@ mod tests {
             trie.try_subscribe(&deep, "c2".into(), QoS::AtMostOnce),
             Err(FilterError::TooDeep)
         );
+    }
+
+    #[test]
+    fn test_unsubscribe_prunes_empty_nodes() {
+        let mut trie = TopicTrie::new();
+        assert_eq!(trie.node_count(), 1);
+
+        let filters: Vec<String> = (0..1000)
+            .map(|i| match i % 3 {
+                0 => format!("devices/dev-{i}/status"),
+                1 => format!("sensors/{i}/+/temp"),
+                _ => format!("logs/{i}/#"),
+            })
+            .collect();
+
+        for filter in &filters {
+            trie.subscribe(filter, "client1".into(), QoS::AtMostOnce);
+        }
+        assert!(trie.node_count() > 1000);
+
+        for filter in &filters {
+            trie.unsubscribe(filter, "client1");
+        }
+        assert_eq!(trie.node_count(), 1);
+    }
+
+    #[test]
+    fn test_remove_client_prunes_empty_nodes() {
+        let mut trie = TopicTrie::new();
+        assert_eq!(trie.node_count(), 1);
+
+        for i in 0..1000 {
+            let filter = match i % 3 {
+                0 => format!("devices/dev-{i}/status"),
+                1 => format!("sensors/{i}/+/temp"),
+                _ => format!("logs/{i}/#"),
+            };
+            trie.subscribe(&filter, "client1".into(), QoS::AtMostOnce);
+        }
+        assert!(trie.node_count() > 1000);
+
+        trie.remove_client("client1");
+        assert_eq!(trie.node_count(), 1);
     }
 }
