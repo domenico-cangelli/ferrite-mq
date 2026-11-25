@@ -1007,3 +1007,83 @@ async fn test_publish_qos2_closes_connection_and_does_not_deliver() {
     pub_q1.disconnect().await.unwrap();
     sub_client.disconnect().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_takeover_stress_leaves_no_orphan_subscriptions() {
+    use bytes::BytesMut;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::codec::Encoder;
+
+    let broker_addr = start_test_broker().await;
+
+    // Pre-codifichiamo CONNECT + SUBSCRIBE "race/#" in un unico buffer per inviarli in pipeline.
+    let mut codec = MqttCodec::default();
+    let mut pipelined = BytesMut::new();
+    codec
+        .encode(
+            Packet::Connect {
+                protocol_version: ProtocolVersion::Mqtt311,
+                clean_session: true,
+                keep_alive: 60,
+                client_id: "dup".into(),
+                will: None,
+                username: None,
+                password: None,
+            },
+            &mut pipelined,
+        )
+        .unwrap();
+    codec
+        .encode(
+            Packet::Subscribe {
+                packet_id: 1,
+                topics: vec![ferrite_protocol::SubscribeTopic {
+                    filter: "race/#".into(),
+                    qos: QoS::AtMostOnce,
+                }],
+            },
+            &mut pipelined,
+        )
+        .unwrap();
+    let pipelined_bytes = pipelined.freeze();
+
+    for _ in 0..50 {
+        // Socket A invia CONNECT + SUBSCRIBE "race/#" in un solo write_all
+        let mut sock_a = tokio::net::TcpStream::connect(broker_addr).await.unwrap();
+        sock_a.write_all(&pipelined_bytes).await.unwrap();
+
+        // Socket B fa subito takeover dello stesso client_id "dup"
+        let mut sock_b = raw_connect(broker_addr, "dup", 60).await;
+
+        // Attendiamo che A venga chiusa dal broker (o al più 2s)
+        let mut framed_a = Framed::new(sock_a, MqttCodec::default());
+        let _ = timeout(Duration::from_secs(2), async {
+            while framed_a.next().await.is_some() {}
+        })
+        .await;
+
+        // Chiudiamo B con DISCONNECT pulito
+        let _ = sock_b.send(Packet::Disconnect).await;
+    }
+
+    // Connessione finale pulita con lo stesso client_id "dup", SENZA alcuna SUBSCRIBE.
+    // Se una vecchia connessione avesse lasciato "race/#" orfano nel trie, riceverebbe il messaggio.
+    let (final_dup, mut dup_rx) = connect(MqttOptions::new("dup", broker_addr)).await.unwrap();
+    let (pub_client, _pub_rx) = connect(MqttOptions::new("race-publisher", broker_addr))
+        .await
+        .unwrap();
+    pub_client
+        .publish("race/x", Bytes::from_static(b"should-not-arrive"))
+        .await
+        .unwrap();
+
+    let nothing = timeout(Duration::from_millis(300), dup_rx.recv()).await;
+    assert!(
+        nothing.is_err(),
+        "il client 'dup' ha ricevuto un messaggio da una sottoscrizione orfana: {:?}",
+        nothing
+    );
+
+    pub_client.disconnect().await.unwrap();
+    final_dup.disconnect().await.unwrap();
+}
