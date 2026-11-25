@@ -86,14 +86,24 @@ fn apply_subscribe(
         .collect()
 }
 
+/// Applica le sottoscrizioni solo se `conn_id` è ancora la proprietaria corrente di
+/// `client_id`. Prende i lock nell'ordine fisso `trie` (write) -> `sessions` (read)
+/// e li rilascia prima di ritornare, senza mai fare I/O sotto lock.
 async fn subscribe_if_owner(
     state: &BrokerState,
     client_id: &str,
-    _conn_id: u64,
+    conn_id: u64,
     topics: &[SubscribeTopic],
     filters: &mut HashSet<String>,
 ) -> Option<Vec<SubAckReturnCode>> {
     let mut trie = state.trie.write().await;
+    let sessions = state.sessions.read().await;
+    let still_owner = sessions
+        .get(client_id)
+        .is_some_and(|session| session.conn_id == conn_id);
+    if !still_owner {
+        return None;
+    }
     Some(apply_subscribe(&mut trie, client_id, topics, filters))
 }
 
@@ -308,6 +318,7 @@ async fn handle_client(
             &mut framed,
             &mut rx,
             &client_id,
+            conn_id,
             keep_alive,
             &state,
             &mut subscribed_filters,
@@ -328,6 +339,7 @@ async fn session_loop(
     framed: &mut Framed<TcpStream, MqttCodec>,
     rx: &mut mpsc::Receiver<Packet>,
     client_id: &str,
+    conn_id: u64,
     keep_alive: Option<Duration>,
     state: &BrokerState,
     subscribed_filters: &mut HashSet<String>,
@@ -339,6 +351,10 @@ async fn session_loop(
 
     loop {
         tokio::select! {
+            // Ordine deterministico: la chiusura del canale (takeover) deve sempre vincere
+            // sui pacchetti in arrivo già pronti nel buffer del socket.
+            biased;
+
             // Messaggi in uscita dalla coda interna (es. pubblicazioni di altri client)
             outgoing = rx.recv() => {
                 match outgoing {
@@ -376,12 +392,22 @@ async fn session_loop(
                             );
                             return Ok(());
                         }
-                        // Il write lock sul trie vive solo dentro questo blocco: viene
-                        // rilasciato prima dell'I/O di rete, altrimenti un client lento
-                        // nel ricevere il SUBACK bloccherebbe tutti gli altri.
-                        let return_codes = {
-                            let mut trie = state.trie.write().await;
-                            apply_subscribe(&mut trie, client_id, &topics, subscribed_filters)
+                        // Il controllo di proprietà e la scrittura nel trie avvengono sotto lock
+                        // in `subscribe_if_owner`, che rilascia i lock prima di inviare il SUBACK.
+                        let Some(return_codes) = subscribe_if_owner(
+                            state,
+                            client_id,
+                            conn_id,
+                            &topics,
+                            subscribed_filters,
+                        )
+                        .await
+                        else {
+                            info!(
+                                "Client [{}] session replaced before applying SUBSCRIBE, closing",
+                                client_id
+                            );
+                            return Ok(());
                         };
                         send_with_timeout(
                             framed,
