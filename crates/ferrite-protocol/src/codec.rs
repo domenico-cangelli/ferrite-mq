@@ -80,16 +80,23 @@ impl Decoder for MqttCodec {
         match packet_type {
             PacketType::Connect => {
                 let proto_name = Self::decode_string(&mut body)?;
-                if proto_name != "MQTT" && proto_name != "MQIsdp" {
+                if proto_name != "MQTT" {
                     return Err(ProtocolError::InvalidPacketType(0));
                 }
 
-                if body.remaining() < 4 {
+                if body.remaining() < 1 {
                     return Err(ProtocolError::Incomplete);
                 }
 
                 let version_byte = body.get_u8();
-                let protocol_version = ProtocolVersion::try_from(version_byte)?;
+                if version_byte != ProtocolVersion::Mqtt311 as u8 {
+                    return Err(ProtocolError::UnsupportedProtocolLevel(version_byte));
+                }
+                let protocol_version = ProtocolVersion::Mqtt311;
+
+                if body.remaining() < 3 {
+                    return Err(ProtocolError::Incomplete);
+                }
 
                 let connect_flags = body.get_u8();
                 let keep_alive = body.get_u16();
@@ -702,5 +709,46 @@ mod tests {
             codec.decode(&mut buf_suback),
             Err(ProtocolError::InvalidPacketId)
         ));
+    }
+
+    #[test]
+    fn test_connect_unsupported_protocol_level_3_and_5() {
+        let mut codec = MqttCodec::default();
+
+        // Livello 5 (MQTT 5.0)
+        let mut buf_v5 = BytesMut::new();
+        codec
+            .encode(
+                Packet::Connect {
+                    protocol_version: ProtocolVersion::Mqtt50,
+                    clean_session: true,
+                    keep_alive: 60,
+                    client_id: "c-v5".to_string(),
+                    will: None,
+                    username: None,
+                    password: None,
+                },
+                &mut buf_v5,
+            )
+            .unwrap();
+        assert!(matches!(
+            codec.decode(&mut buf_v5),
+            Err(ProtocolError::UnsupportedProtocolLevel(5))
+        ));
+        assert!(buf_v5.is_empty());
+
+        // Livello 3 con nome protocollo "MQTT" (costruito a mano)
+        let mut buf_v3 = BytesMut::new();
+        // Fixed header: CONNECT (0x10), remaining length = 12
+        // Variable header: "MQTT" (0x00, 0x04, 'M','Q','T','T'), level=3, flags=0x02, keep_alive=60
+        // Payload: empty client_id (0x00, 0x00)
+        buf_v3.put_slice(&[
+            0x10, 0x0C, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x03, 0x02, 0x00, 0x3C, 0x00, 0x00,
+        ]);
+        assert!(matches!(
+            codec.decode(&mut buf_v3),
+            Err(ProtocolError::UnsupportedProtocolLevel(3))
+        ));
+        assert!(buf_v3.is_empty());
     }
 }

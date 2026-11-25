@@ -1,6 +1,6 @@
 use crate::trie::{validate_topic_name, TopicTrie};
 use ferrite_protocol::{
-    ConnectReturnCode, MqttCodec, Packet, QoS, SubAckReturnCode, SubscribeTopic,
+    ConnectReturnCode, MqttCodec, Packet, ProtocolError, QoS, SubAckReturnCode, SubscribeTopic,
 };
 use futures::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
@@ -16,6 +16,9 @@ use tracing::{error, info, warn};
 
 type ClientSender = mpsc::Sender<Packet>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Tempo massimo concesso al client per inviare il pacchetto `CONNECT` iniziale.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Tempo massimo concesso per scrivere un pacchetto sul socket di un client.
 /// Se il client non legge e il buffer TCP resta pieno oltre questa soglia,
@@ -113,6 +116,28 @@ impl BrokerState {
         }
     }
 
+    /// Genera un `client_id` univoco nel formato `ferrite-auto-<conn_id>` (con suffisso
+    /// numerico in caso di collisione con un client già connesso) e registra la sessione
+    /// atomicamente sotto lock (MQTT-3.1.3-6).
+    async fn register_anonymous_session(&self, handle: SessionHandle) -> String {
+        let mut sessions = self.sessions.write().await;
+        let base = format!("ferrite-auto-{}", handle.conn_id);
+        let client_id = if !sessions.contains_key(&base) {
+            base
+        } else {
+            let mut suffix = 1u64;
+            loop {
+                let candidate = format!("{base}-{suffix}");
+                if !sessions.contains_key(&candidate) {
+                    break candidate;
+                }
+                suffix += 1;
+            }
+        };
+        sessions.insert(client_id.clone(), handle);
+        client_id
+    }
+
     /// Pulizia a fine connessione. Agisce solo se questa connessione è ancora la
     /// proprietaria del `client_id`: se un'altra l'ha rimpiazzata, sessione e
     /// sottoscrizioni ora appartengono a quella e non vanno toccate.
@@ -139,7 +164,9 @@ pub async fn run_server(listener: TcpListener) -> Result<(), BoxError> {
             Ok((socket, peer_addr)) => {
                 let state_clone = state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(socket, peer_addr, state_clone).await {
+                    if let Err(e) =
+                        handle_client(socket, peer_addr, state_clone, CONNECT_TIMEOUT).await
+                    {
                         error!("Connection error with {}: {:?}", peer_addr, e);
                     }
                 });
@@ -153,32 +180,104 @@ pub async fn run_server(listener: TcpListener) -> Result<(), BoxError> {
 
 async fn handle_client(
     stream: TcpStream,
-    _peer_addr: SocketAddr,
+    peer_addr: SocketAddr,
     state: BrokerState,
+    connect_timeout: Duration,
 ) -> Result<(), BoxError> {
     let mut framed = Framed::new(stream, MqttCodec::default());
 
-    // 1. Handshake iniziale: il primo pacchetto deve essere un CONNECT
-    let (client_id, keep_alive) = match framed.next().await {
-        Some(Ok(Packet::Connect {
-            client_id,
-            keep_alive,
-            ..
-        })) => {
-            // Specifica MQTT: timeout effettivo = keep_alive * 1.5; keep_alive = 0 lo disabilita
-            let timeout = (keep_alive > 0).then(|| Duration::from_millis(keep_alive as u64 * 1500));
-            (client_id, timeout)
-        }
-        _ => return Ok(()),
-    };
+    // 1. Handshake iniziale: il primo pacchetto deve essere un CONNECT entro connect_timeout
+    let (raw_client_id, clean_session, keep_alive) =
+        match timeout(connect_timeout, framed.next()).await {
+            Ok(Some(Ok(Packet::Connect {
+                client_id,
+                clean_session,
+                keep_alive,
+                ..
+            }))) => {
+                // Specifica MQTT: timeout effettivo = keep_alive * 1.5; keep_alive = 0 lo disabilita
+                let keep_alive_timeout =
+                    (keep_alive > 0).then(|| Duration::from_millis(keep_alive as u64 * 1500));
+                (client_id, clean_session, keep_alive_timeout)
+            }
+            Ok(Some(Err(ProtocolError::UnsupportedProtocolLevel(level)))) => {
+                warn!(
+                    "Client {} sent unsupported MQTT protocol level {}, sending CONNACK 0x01",
+                    peer_addr, level
+                );
+                let _ = send_with_timeout(
+                    &mut framed,
+                    Packet::ConnAck {
+                        session_present: false,
+                        return_code: ConnectReturnCode::RefusedUnacceptableProtocolVersion,
+                    },
+                    WRITE_TIMEOUT,
+                )
+                .await;
+                return Ok(());
+            }
+            Ok(Some(Ok(other))) => {
+                warn!(
+                "Client {} sent {:?} instead of CONNECT as first packet (MQTT-3.1.0-1), closing",
+                peer_addr, other
+            );
+                return Ok(());
+            }
+            Ok(Some(Err(e))) => {
+                warn!(
+                    "Protocol/IO error from {} before CONNECT: {:?}",
+                    peer_addr, e
+                );
+                return Ok(());
+            }
+            Ok(None) => {
+                warn!(
+                    "Client {} closed connection before sending CONNECT",
+                    peer_addr
+                );
+                return Ok(());
+            }
+            Err(_) => {
+                warn!("Client {} timed out waiting for initial CONNECT", peer_addr);
+                return Ok(());
+            }
+        };
 
     // 2. Registriamo la sessione *prima* di inviare il CONNACK: quando il client lo
     // riceve, il broker è già pronto a instradargli i messaggi.
     let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::channel::<Packet>(100);
-    state
-        .register_session(&client_id, SessionHandle { conn_id, tx })
-        .await;
+    let client_id = if raw_client_id.is_empty() {
+        if !clean_session {
+            warn!(
+                "Client {} sent empty client_id with clean_session=false (MQTT-3.1.3-7), sending CONNACK 0x02",
+                peer_addr
+            );
+            let _ = send_with_timeout(
+                &mut framed,
+                Packet::ConnAck {
+                    session_present: false,
+                    return_code: ConnectReturnCode::RefusedIdentifierRejected,
+                },
+                WRITE_TIMEOUT,
+            )
+            .await;
+            return Ok(());
+        }
+        let assigned = state
+            .register_anonymous_session(SessionHandle { conn_id, tx })
+            .await;
+        info!(
+            "Assigned generated client_id [{}] to anonymous client {}",
+            assigned, peer_addr
+        );
+        assigned
+    } else {
+        state
+            .register_session(&raw_client_id, SessionHandle { conn_id, tx })
+            .await;
+        raw_client_id
+    };
 
     // 3. Da qui in poi qualsiasi errore (anche propagato con `?`) deve comunque
     // passare dalla pulizia: per questo il ciclo vive in un blocco separato e la
@@ -365,11 +464,31 @@ async fn session_loop(
                         }
                     }
                     Some(Ok(Packet::Disconnect)) | None => return Ok(()),
+                    Some(Ok(Packet::Connect { .. })) => {
+                        warn!(
+                            "[{}] Received second CONNECT packet, protocol violation (MQTT-3.1.0-2), closing",
+                            client_id
+                        );
+                        return Ok(());
+                    }
+                    Some(Ok(
+                        packet @ (Packet::ConnAck { .. }
+                        | Packet::SubAck { .. }
+                        | Packet::PingResp),
+                    )) => {
+                        warn!(
+                            "[{}] Received server-only packet {:?}, protocol violation, closing",
+                            client_id, packet
+                        );
+                        return Ok(());
+                    }
+                    Some(Ok(Packet::PubAck { .. })) => {
+                        // Fase 2: gestione PUBACK dal subscriber per QoS 1 in uscita.
+                    }
                     Some(Err(e)) => {
                         warn!("Protocol error from [{}]: {:?}", client_id, e);
                         return Ok(());
                     }
-                    Some(Ok(_)) => {}
                 }
             }
         }
@@ -527,5 +646,27 @@ mod tests {
             .downcast_ref::<std::io::Error>()
             .expect("atteso std::io::Error");
         assert_eq!(io_err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn test_idle_socket_without_connect_is_closed_on_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = BrokerState::default();
+
+        let server_task = tokio::spawn(async move {
+            let (socket, peer_addr) = listener.accept().await.unwrap();
+            let _ = handle_client(socket, peer_addr, state, Duration::from_millis(100)).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, MqttCodec::default());
+
+        // Non inviamo nulla: entro 1 secondo il broker deve chiudere la connessione.
+        let res = timeout(Duration::from_secs(1), framed.next())
+            .await
+            .expect("il broker non ha chiuso la socket muta dopo CONNECT_TIMEOUT");
+        assert!(res.is_none());
+        server_task.await.unwrap();
     }
 }
