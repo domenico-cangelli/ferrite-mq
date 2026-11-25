@@ -26,4 +26,7 @@ pub enum ProtocolError {
 
     #[error("Invalid packet identifier: 0 is forbidden by MQTT specification")]
     InvalidPacketId,
+
+    #[error("Unsupported MQTT protocol level: {0}")]
+    UnsupportedProtocolLevel(u8),
 }
