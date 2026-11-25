@@ -246,22 +246,40 @@ async fn session_loop(
 
                         // 3. Instradamento ai subscriber trovati
                         if !matched.is_empty() {
-                            let sessions = state.sessions.read().await;
-                            for sub in matched {
-                                if let Some(session) = sessions.get(&sub.client_id) {
-                                    let _ = session
-                                        .tx
-                                        .send(Packet::Publish {
-                                            topic: topic.clone(),
-                                            // Il QoS 1 in uscita non è ancora supportato (servirebbe un
-                                            // packet_id dedicato): consegniamo a QoS 0.
-                                            qos: QoS::AtMostOnce,
-                                            retain,
-                                            dup,
-                                            packet_id: None,
-                                            payload: payload.clone(),
-                                        })
-                                        .await;
+                            // Il read lock su `sessions` vive solo dentro questo blocco:
+                            // cloniamo i sender e rilasciamo il lock prima di inviare.
+                            let targets: Vec<(String, ClientSender)> = {
+                                let sessions = state.sessions.read().await;
+                                matched
+                                    .into_iter()
+                                    .filter_map(|sub| {
+                                        sessions
+                                            .get(&sub.client_id)
+                                            .map(|session| (sub.client_id, session.tx.clone()))
+                                    })
+                                    .collect()
+                            };
+
+                            for (target_client_id, tx) in targets {
+                                let outgoing = Packet::Publish {
+                                    topic: topic.clone(),
+                                    // Il QoS 1 in uscita non è ancora supportato (servirebbe un
+                                    // packet_id dedicato): consegniamo a QoS 0.
+                                    qos: QoS::AtMostOnce,
+                                    retain,
+                                    dup,
+                                    packet_id: None,
+                                    payload: payload.clone(),
+                                };
+                                match tx.try_send(outgoing) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        warn!(
+                                            "Dropping QoS 0 message for slow client [{}]: outbound queue full",
+                                            target_client_id
+                                        );
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {}
                                 }
                             }
                         }
