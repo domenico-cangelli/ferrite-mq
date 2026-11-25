@@ -185,6 +185,11 @@ impl Decoder for MqttCodec {
                 let retain = (flags & 0x01) != 0;
                 let qos = QoS::try_from(qos_val)?;
 
+                // MQTT-3.3.1-2: il flag DUP deve essere 0 per tutti i PUBLISH QoS 0.
+                if qos == QoS::AtMostOnce && dup {
+                    return Err(ProtocolError::InvalidPacketType(first_byte));
+                }
+
                 let topic = Self::decode_string(&mut body)?;
 
                 let packet_id = if qos != QoS::AtMostOnce {
@@ -750,5 +755,29 @@ mod tests {
             Err(ProtocolError::UnsupportedProtocolLevel(3))
         ));
         assert!(buf_v3.is_empty());
+    }
+
+    #[test]
+    fn test_publish_qos0_with_dup_is_rejected() {
+        let mut codec = MqttCodec::default();
+        let mut buffer = BytesMut::new();
+
+        codec
+            .encode(
+                Packet::Publish {
+                    topic: "t/x".to_string(),
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    dup: true,
+                    packet_id: None,
+                    payload: Bytes::from_static(b"hi"),
+                },
+                &mut buffer,
+            )
+            .unwrap();
+
+        let result = codec.decode(&mut buffer);
+        assert!(matches!(result, Err(ProtocolError::InvalidPacketType(_))));
+        assert!(buffer.is_empty());
     }
 }

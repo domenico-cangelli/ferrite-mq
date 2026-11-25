@@ -838,7 +838,7 @@ async fn test_forwarded_publish_clears_retain_and_dup_from_qos0_publisher() {
             topic: "t/x".into(),
             qos: QoS::AtMostOnce,
             retain: true,
-            dup: true,
+            dup: false,
             packet_id: None,
             payload: Bytes::from_static(b"hello"),
         })
