@@ -385,10 +385,9 @@ async fn session_loop(
                     Some(Ok(Packet::Publish {
                         topic,
                         qos,
-                        retain,
-                        dup,
                         packet_id,
                         payload,
+                        ..
                     })) => {
                         if let Err(err) = validate_topic_name(&topic) {
                             warn!(
@@ -445,8 +444,11 @@ async fn session_loop(
                                     // Il QoS 1 in uscita non è ancora supportato (servirebbe un
                                     // packet_id dedicato): consegniamo a QoS 0.
                                     qos: QoS::AtMostOnce,
-                                    retain,
-                                    dup,
+                                    // MQTT-3.3.1-9: RETAIN=0 per sottoscrizioni già esistenti
+                                    // (i retained verranno consegnati al SUBSCRIBE in Fase 4).
+                                    retain: false,
+                                    // MQTT-3.3.1-2: DUP vale sulla singola tratta ed è sempre 0 a QoS 0.
+                                    dup: false,
                                     packet_id: None,
                                     payload: payload.clone(),
                                 };
