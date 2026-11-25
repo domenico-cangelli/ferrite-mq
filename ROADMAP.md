@@ -183,7 +183,7 @@ Attualmente il broker recapita i messaggi ai subscriber con `packet_id: None` (c
 | :--- | :--- | :--- |
 | ~~Possibile deadlock: nel ramo `Publish` si fa `tx.send(..).await` su un canale limitato tenendo il read lock su `sessions`. Se due client si inviano messaggi e le code si riempiono, restano in attesa reciproca.~~ | `broker-core/server.rs` | Risolto (issue #3: fan-out non bloccante con `try_send` e timeout di scrittura) |
 | ~~Finestra di race stretta: se un takeover avviene mentre la vecchia connessione elabora un `SUBSCRIBE`, può reiscrivere un filtro per il `client_id` ormai appartenente alla nuova.~~ | `broker-core/server.rs` | Risolto (issue #12: `biased;` nel `select!` + controllo proprietà sotto lock in `subscribe_if_owner`) |
-| `encode_string` tronca con `as u16` le stringhe più lunghe di 65535 byte invece di restituire un errore. | `protocol/codec.rs` | Prima di aprire il progetto al pubblico |
+| ~~`encode_string` tronca con `as u16` le stringhe più lunghe di 65535 byte invece di restituire un errore.~~ | `protocol/codec.rs` | Risolto (issue #10: `encode_str`/`encode_bytes` con `StringTooLong` e scrittura atomica) |
 | Il `Will` ricevuto nel `CONNECT` è decodificato ma il broker lo ignora. | `broker-core/server.rs` | Fase 4 |
 | ~~Il broker non gestisce `UNSUBSCRIBE`: il trie ha `unsubscribe`, ma non è raggiungibile dalla rete.~~ | `protocol`, `broker-core` | Risolto (issue #9: `UNSUBSCRIBE`/`UNSUBACK` end-to-end in protocollo, broker e client) |
 

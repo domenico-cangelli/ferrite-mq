@@ -49,9 +49,15 @@ impl MqttCodec {
         Ok(())
     }
 
-    fn encode_string(src: &str, dst: &mut BytesMut) {
-        dst.put_u16(src.len() as u16);
-        dst.put_slice(src.as_bytes());
+    fn encode_bytes(dst: &mut BytesMut, src: &[u8]) -> Result<(), ProtocolError> {
+        let len = u16::try_from(src.len()).map_err(|_| ProtocolError::StringTooLong(src.len()))?;
+        dst.put_u16(len);
+        dst.put_slice(src);
+        Ok(())
+    }
+
+    fn encode_str(dst: &mut BytesMut, src: &str) -> Result<(), ProtocolError> {
+        Self::encode_bytes(dst, src.as_bytes())
     }
 }
 
@@ -436,7 +442,7 @@ impl Encoder<Packet> for MqttCodec {
                 let mut body = BytesMut::new();
 
                 // Protocol Name ("MQTT")
-                Self::encode_string("MQTT", &mut body);
+                Self::encode_str(&mut body, "MQTT")?;
 
                 // Protocol Level
                 body.put_u8(protocol_version as u8);
@@ -465,30 +471,30 @@ impl Encoder<Packet> for MqttCodec {
                 body.put_u16(keep_alive);
 
                 // Payload: Client Identifier
-                Self::encode_string(&client_id, &mut body);
+                Self::encode_str(&mut body, &client_id)?;
 
                 // Payload: Will Topic + Will Payload (nell'ordine imposto dalla spec)
                 if let Some(will) = &will {
-                    Self::encode_string(&will.topic, &mut body);
-                    body.put_u16(will.payload.len() as u16);
-                    body.put_slice(&will.payload);
+                    Self::encode_str(&mut body, &will.topic)?;
+                    Self::encode_bytes(&mut body, &will.payload)?;
                 }
 
                 // Payload: Username
                 if let Some(user) = &username {
-                    Self::encode_string(user, &mut body);
+                    Self::encode_str(&mut body, user)?;
                 }
 
                 // Payload: Password
                 if let Some(pass) = &password {
-                    body.put_u16(pass.len() as u16);
-                    body.put_slice(pass);
+                    Self::encode_bytes(&mut body, pass)?;
                 }
 
-                // Fixed Header
-                dst.put_u8((PacketType::Connect as u8) << 4);
+                // Tutto validato: codifichiamo il varint prima di toccare `dst`.
                 let mut varint_buf = Vec::with_capacity(4);
                 encode_varint(body.len(), &mut varint_buf)?;
+
+                // Scrittura atomica in `dst`
+                dst.put_u8((PacketType::Connect as u8) << 4);
                 dst.put_slice(&varint_buf);
                 dst.put(body);
             }
@@ -524,6 +530,22 @@ impl Encoder<Packet> for MqttCodec {
                 packet_id,
                 payload,
             } => {
+                let id_for_qos = if qos != QoS::AtMostOnce {
+                    Some(packet_id.ok_or(ProtocolError::MalformedPacket("missing packet id"))?)
+                } else {
+                    None
+                };
+
+                let mut body = BytesMut::with_capacity(2 + topic.len() + 2 + payload.len());
+                Self::encode_str(&mut body, &topic)?;
+                if let Some(id) = id_for_qos {
+                    body.put_u16(id);
+                }
+                body.put_slice(&payload);
+
+                let mut varint_buf = Vec::with_capacity(4);
+                encode_varint(body.len(), &mut varint_buf)?;
+
                 let mut first_byte = (PacketType::Publish as u8) << 4;
                 if dup {
                     first_byte |= 0x08;
@@ -533,25 +555,9 @@ impl Encoder<Packet> for MqttCodec {
                     first_byte |= 0x01;
                 }
 
-                let mut remaining_len = 2 + topic.len();
-                if qos != QoS::AtMostOnce {
-                    remaining_len += 2;
-                }
-                remaining_len += payload.len();
-
                 dst.put_u8(first_byte);
-                let mut varint_buf = Vec::with_capacity(4);
-                encode_varint(remaining_len, &mut varint_buf)?;
                 dst.put_slice(&varint_buf);
-
-                Self::encode_string(&topic, dst);
-
-                if qos != QoS::AtMostOnce {
-                    let id = packet_id.ok_or(ProtocolError::Incomplete)?;
-                    dst.put_u16(id);
-                }
-
-                dst.put_slice(&payload);
+                dst.put(body);
             }
 
             Packet::Subscribe { packet_id, topics } => {
@@ -562,13 +568,14 @@ impl Encoder<Packet> for MqttCodec {
                 body.put_u16(packet_id);
 
                 for topic in topics {
-                    Self::encode_string(&topic.filter, &mut body);
+                    Self::encode_str(&mut body, &topic.filter)?;
                     body.put_u8(topic.qos as u8);
                 }
 
-                dst.put_u8(first_byte);
                 let mut varint_buf = Vec::with_capacity(4);
                 encode_varint(body.len(), &mut varint_buf)?;
+
+                dst.put_u8(first_byte);
                 dst.put_slice(&varint_buf);
                 dst.put(body);
             }
@@ -586,9 +593,10 @@ impl Encoder<Packet> for MqttCodec {
                     body.put_u8(code as u8);
                 }
 
-                dst.put_u8(first_byte);
                 let mut varint_buf = Vec::with_capacity(4);
                 encode_varint(body.len(), &mut varint_buf)?;
+
+                dst.put_u8(first_byte);
                 dst.put_slice(&varint_buf);
                 dst.put(body);
             }
@@ -609,12 +617,13 @@ impl Encoder<Packet> for MqttCodec {
                 let mut body = BytesMut::new();
                 body.put_u16(packet_id);
                 for filter in filters {
-                    Self::encode_string(&filter, &mut body);
+                    Self::encode_str(&mut body, &filter)?;
                 }
 
-                dst.put_u8(first_byte);
                 let mut varint_buf = Vec::with_capacity(4);
                 encode_varint(body.len(), &mut varint_buf)?;
+
+                dst.put_u8(first_byte);
                 dst.put_slice(&varint_buf);
                 dst.put(body);
             }
@@ -1265,5 +1274,85 @@ mod tests {
             codec.decode(&mut buf_empty_topic),
             Err(ProtocolError::MalformedPacket("empty topic"))
         ));
+    }
+
+    #[test]
+    fn test_encoder_rejects_oversized_fields_and_missing_packet_id_atomically() {
+        let mut codec = MqttCodec::default();
+        let initial_prefix = b"existing-bytes";
+
+        // 1. Topic da 70000 byte -> StringTooLong(70000), dst invariato
+        let mut dst = BytesMut::from(&initial_prefix[..]);
+        let res = codec.encode(
+            Packet::Publish {
+                topic: "t".repeat(70_000),
+                qos: QoS::AtMostOnce,
+                retain: false,
+                dup: false,
+                packet_id: None,
+                payload: Bytes::new(),
+            },
+            &mut dst,
+        );
+        assert!(matches!(res, Err(ProtocolError::StringTooLong(70_000))));
+        assert_eq!(&dst[..], initial_prefix);
+
+        // 2. Will payload da 70000 byte -> StringTooLong(70000), dst invariato
+        let mut dst = BytesMut::from(&initial_prefix[..]);
+        let res = codec.encode(
+            Packet::Connect {
+                protocol_version: ProtocolVersion::Mqtt311,
+                clean_session: true,
+                keep_alive: 60,
+                client_id: "c1".into(),
+                will: Some(Will {
+                    topic: "will/t".into(),
+                    payload: Bytes::from(vec![b'w'; 70_000]),
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                }),
+                username: None,
+                password: None,
+            },
+            &mut dst,
+        );
+        assert!(matches!(res, Err(ProtocolError::StringTooLong(70_000))));
+        assert_eq!(&dst[..], initial_prefix);
+
+        // 3. Password da 70000 byte -> StringTooLong(70000), dst invariato
+        let mut dst = BytesMut::from(&initial_prefix[..]);
+        let res = codec.encode(
+            Packet::Connect {
+                protocol_version: ProtocolVersion::Mqtt311,
+                clean_session: true,
+                keep_alive: 60,
+                client_id: "c1".into(),
+                will: None,
+                username: Some("user".into()),
+                password: Some(Bytes::from(vec![b'p'; 70_000])),
+            },
+            &mut dst,
+        );
+        assert!(matches!(res, Err(ProtocolError::StringTooLong(70_000))));
+        assert_eq!(&dst[..], initial_prefix);
+
+        // 4. PUBLISH QoS 1 con packet_id: None -> MalformedPacket("missing packet id"), dst invariato
+        let mut dst = BytesMut::from(&initial_prefix[..]);
+        let res = codec.encode(
+            Packet::Publish {
+                topic: "a/b".into(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                dup: false,
+                packet_id: None,
+                payload: Bytes::from_static(b"data"),
+            },
+            &mut dst,
+        );
+        assert!(matches!(
+            res,
+            Err(ProtocolError::MalformedPacket("missing packet id"))
+        ));
+        assert_eq!(&dst[..], initial_prefix);
     }
 }
