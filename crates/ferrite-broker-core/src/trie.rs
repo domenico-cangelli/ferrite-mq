@@ -49,10 +49,7 @@ impl TopicTrie {
                 }
                 current = current.plus_child.as_deref_mut().unwrap();
             } else {
-                current = current
-                    .children
-                    .entry(token.to_string())
-                    .or_default();
+                current = current.children.entry(token.to_string()).or_default();
             }
 
             // Se siamo all'ultimo livello e non era '#', registriamo la sottoscrizione

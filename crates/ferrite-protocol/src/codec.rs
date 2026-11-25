@@ -240,7 +240,10 @@ impl Decoder for MqttCodec {
                     return_codes.push(code);
                 }
 
-                Ok(Some(Packet::SubAck { packet_id, return_codes }))
+                Ok(Some(Packet::SubAck {
+                    packet_id,
+                    return_codes,
+                }))
             }
 
             PacketType::PubAck => {
@@ -419,7 +422,10 @@ impl Encoder<Packet> for MqttCodec {
                 dst.put(body);
             }
 
-            Packet::SubAck { packet_id, return_codes } => {
+            Packet::SubAck {
+                packet_id,
+                return_codes,
+            } => {
                 let first_byte = (PacketType::SubAck as u8) << 4;
 
                 let mut body = BytesMut::new();
@@ -444,9 +450,6 @@ impl Encoder<Packet> for MqttCodec {
                 // Variable Header: Packet Identifier
                 dst.put_u16(packet_id);
             }
-
-
-
         }
         Ok(())
     }
@@ -513,7 +516,10 @@ mod tests {
 
         let suback = Packet::SubAck {
             packet_id: 101,
-            return_codes: vec![crate::SubAckReturnCode::SuccessQoS1, crate::SubAckReturnCode::SuccessQoS0],
+            return_codes: vec![
+                crate::SubAckReturnCode::SuccessQoS1,
+                crate::SubAckReturnCode::SuccessQoS0,
+            ],
         };
 
         codec.encode(suback.clone(), &mut buffer).unwrap();

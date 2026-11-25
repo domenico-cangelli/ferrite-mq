@@ -40,4 +40,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Collegamenti interni tra i nostri stessi crate
 ferrite-protocol = { path = "crates/ferrite-protocol" }
 ferrite-broker-core = { path = "crates/ferrite-broker-core" }
-ferrite-client = { path = "crates/ferrite-client" }

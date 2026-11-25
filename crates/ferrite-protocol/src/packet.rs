@@ -1,6 +1,6 @@
 use crate::error::ProtocolError;
-use bytes::Bytes;
 use crate::QoS::{AtLeastOnce, AtMostOnce, ExactlyOnce};
+use bytes::Bytes;
 
 /// MQTT Quality of Service levels according to OASIS specification.
 ///
@@ -25,7 +25,7 @@ impl TryFrom<u8> for QoS {
             0 => Ok(AtMostOnce),
             1 => Ok(AtLeastOnce),
             2 => Ok(ExactlyOnce),
-            other => Err(ProtocolError::InvalidQoS(other))
+            other => Err(ProtocolError::InvalidQoS(other)),
         }
     }
 }
@@ -214,6 +214,5 @@ pub enum Packet {
     },
     PubAck {
         packet_id: u16,
-    }
+    },
 }
-

@@ -1,13 +1,13 @@
 use bytes::Bytes;
 use ferrite_broker_core::run_server;
 use ferrite_client::{connect, MqttOptions, Packet, QoS};
+use ferrite_protocol::{MqttCodec, ProtocolVersion};
+use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::time::Duration;
-use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
-use ferrite_protocol::{MqttCodec, ProtocolVersion};
 
 /// Avvia il broker in background e restituisce l'indirizzo dinamico (es. 127.0.0.1:45321)
 async fn start_test_broker() -> SocketAddr {
@@ -74,7 +74,6 @@ async fn test_pub_sub_roundtrip() {
     pub_client.disconnect().await.unwrap();
 }
 
-
 #[tokio::test]
 async fn test_client_automatic_pingreq() {
     let broker_addr = start_test_broker().await;
@@ -93,8 +92,6 @@ async fn test_client_automatic_pingreq() {
 
     assert_eq!(packet, Packet::PingResp);
 }
-
-
 
 #[tokio::test]
 async fn test_broker_disconnects_inactive_client() {
@@ -129,10 +126,11 @@ async fn test_broker_disconnects_inactive_client() {
             // Successo: la connessione è stata chiusa dal broker per timeout di inattività
         }
         Ok(Some(packet)) => panic!("Ricevuto pacchetto inaspettato: {:?}", packet),
-        Err(_) => panic!("Il broker non ha disconnesso il client entro la finestra temporale prevista"),
+        Err(_) => {
+            panic!("Il broker non ha disconnesso il client entro la finestra temporale prevista")
+        }
     }
 }
-
 
 #[tokio::test]
 async fn test_broker_puback_response_for_qos1() {
@@ -212,9 +210,12 @@ async fn test_client_publish_qos1_with_ack() {
         Duration::from_secs(2),
         pub_client.publish_qos1("orders/processed", payload.clone()),
     )
-        .await;
+    .await;
 
-    assert!(pub_result.is_ok(), "publish_qos1 timed out waiting for PUBACK");
+    assert!(
+        pub_result.is_ok(),
+        "publish_qos1 timed out waiting for PUBACK"
+    );
     pub_result.unwrap().expect("publish_qos1 failed");
 
     // 4. Verifica che il subscriber riceva il payload
@@ -224,7 +225,9 @@ async fn test_client_publish_qos1_with_ack() {
         .unwrap();
 
     match received {
-        Packet::Publish { topic, payload: p, .. } => {
+        Packet::Publish {
+            topic, payload: p, ..
+        } => {
             assert_eq!(topic, "orders/processed");
             assert_eq!(p, payload);
         }
@@ -282,11 +285,17 @@ async fn test_broker_suback_reports_granted_qos() {
         .unwrap();
 
     match response {
-        Packet::SubAck { packet_id, return_codes } => {
+        Packet::SubAck {
+            packet_id,
+            return_codes,
+        } => {
             assert_eq!(packet_id, 7);
             // Un return code per ogni filtro, mai oltre quanto richiesto.
             assert_eq!(return_codes.len(), 2);
-            assert_eq!(return_codes[0], ferrite_protocol::SubAckReturnCode::SuccessQoS0);
+            assert_eq!(
+                return_codes[0],
+                ferrite_protocol::SubAckReturnCode::SuccessQoS0
+            );
             assert_ne!(return_codes[1], ferrite_protocol::SubAckReturnCode::Failure);
         }
         other => panic!("Expected SubAck, got {:?}", other),
