@@ -16,7 +16,7 @@ use tracing::warn;
 
 /// Comandi interni inviati dall'interfaccia Client al Driver di connessione
 #[derive(Debug)]
-pub enum ClientCommand {
+enum ClientCommand {
     PublishQoS0 {
         topic: String,
         payload: Bytes,
