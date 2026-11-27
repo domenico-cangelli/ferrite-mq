@@ -246,15 +246,14 @@ async fn connect_with_timeout(
     let packet_id_counter = Arc::new(AtomicU16::new(1));
     let id_gen = packet_id_counter.clone();
 
-    let ping_duration = if options.keep_alive > 0 {
-        let millis = (options.keep_alive as u64 * 1000 * 3) / 4;
-        Duration::from_millis(millis).max(Duration::from_millis(250))
+    let mut ping_interval = if keep_alive > 0 {
+        let millis = (keep_alive as u64 * 1000 * 3) / 4;
+        let mut iv = interval(Duration::from_millis(millis).max(Duration::from_millis(250)));
+        iv.tick().await;
+        Some(iv)
     } else {
-        Duration::from_secs(u64::MAX / 2)
+        None
     };
-
-    let mut ping_interval = interval(ping_duration);
-    ping_interval.tick().await;
 
     tokio::spawn(async move {
         // Mappa dei pacchetti QoS 1 in volo in attesa di PUBACK
@@ -264,7 +263,14 @@ async fn connect_with_timeout(
 
         loop {
             tokio::select! {
-                _ = ping_interval.tick(), if options.keep_alive > 0 => {
+                _ = async {
+                    match ping_interval.as_mut() {
+                        Some(iv) => {
+                            iv.tick().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
                     if framed.send(Packet::PingReq).await.is_err() {
                         break;
                     }
