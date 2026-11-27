@@ -30,19 +30,12 @@ async fn test_pub_sub_roundtrip() {
     let sub_opts = MqttOptions::new("subscriber-1", broker_addr);
     let (sub_client, mut sub_rx) = connect(sub_opts).await.expect("Failed to connect sub");
 
-    // Iscriviti al topic
-    sub_client
+    // Iscriviti al topic (subscribe attende il SUBACK dal broker)
+    let granted = sub_client
         .subscribe("factory/sensors/temperature", QoS::AtMostOnce)
         .await
         .expect("Failed to subscribe");
-
-    // 3. Attendi la ricezione del SUBACK
-    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
-        .await
-        .expect("Timeout waiting for SUBACK")
-        .expect("Channel closed");
-
-    assert!(matches!(suback, Packet::SubAck { .. }));
+    assert_eq!(granted, QoS::AtMostOnce);
 
     // 4. Connetti il Client Publisher
     let pub_opts = MqttOptions::new("publisher-1", broker_addr);
@@ -197,13 +190,6 @@ async fn test_client_publish_qos1_with_ack() {
         .subscribe("orders/processed", QoS::AtLeastOnce)
         .await
         .unwrap();
-
-    // Attendi SUBACK
-    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(suback, Packet::SubAck { .. }));
 
     // 2. Connetti publisher
     let pub_opts = MqttOptions::new("pub-qos1", broker_addr);
@@ -417,11 +403,6 @@ async fn test_duplicate_client_id_disconnects_old_connection() {
         .subscribe("new/topic", QoS::AtMostOnce)
         .await
         .unwrap();
-    let suback = timeout(Duration::from_secs(2), new_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(suback, Packet::SubAck { .. }));
 
     let (pub_client, _pub_rx) = connect(MqttOptions::new("dup-publisher", broker_addr))
         .await
@@ -505,8 +486,6 @@ async fn test_self_subscriber_flood_does_not_freeze_broker() {
             .subscribe("health/check", QoS::AtMostOnce)
             .await
             .expect("client C failed to subscribe");
-        let suback = rx_c.recv().await.expect("client C channel closed");
-        assert!(matches!(suback, Packet::SubAck { .. }));
 
         let (client_b, _rx_b) = connect(MqttOptions::new("healthy-client-b", broker_addr))
             .await
@@ -608,11 +587,6 @@ async fn test_publish_invalid_topic_closes_connection_and_does_not_deliver() {
         .await
         .unwrap();
     sub_client.subscribe("a/b", QoS::AtMostOnce).await.unwrap();
-    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(suback, Packet::SubAck { .. }));
 
     // 1. PUBLISH con wildcard "a/+" deve chiudere la connessione del publisher.
     let mut pub_wildcard = raw_connect(broker_addr, "pub-wildcard", 60).await;
@@ -825,11 +799,6 @@ async fn test_forwarded_publish_clears_retain_and_dup_from_qos0_publisher() {
         .await
         .unwrap();
     sub_client.subscribe("t/x", QoS::AtMostOnce).await.unwrap();
-    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(suback, Packet::SubAck { .. }));
 
     let mut pub_raw = raw_connect(broker_addr, "pub-retain-qos0", 60).await;
     pub_raw
@@ -878,11 +847,6 @@ async fn test_forwarded_publish_clears_retain_and_dup_from_qos1_publisher() {
         .await
         .unwrap();
     sub_client.subscribe("t/x", QoS::AtLeastOnce).await.unwrap();
-    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(suback, Packet::SubAck { .. }));
 
     let mut pub_raw = raw_connect(broker_addr, "pub-retain-qos1", 60).await;
     pub_raw
@@ -941,11 +905,6 @@ async fn test_publish_qos2_closes_connection_and_does_not_deliver() {
         .await
         .unwrap();
     sub_client.subscribe("t/q2", QoS::AtMostOnce).await.unwrap();
-    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(suback, Packet::SubAck { .. }));
 
     // Publisher P invia PUBLISH QoS 2 con packet_id = 1 su "t/q2"
     let mut pub_q2 = raw_connect(broker_addr, "pub-q2", 60).await;
@@ -1200,11 +1159,6 @@ async fn test_client_unsubscribe_waits_for_unsuback_and_stops_receiving() {
         .subscribe("updates/news", QoS::AtMostOnce)
         .await
         .unwrap();
-    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(suback, Packet::SubAck { .. }));
 
     let (pub_client, _pub_rx) = connect(MqttOptions::new("pub-news", broker_addr))
         .await
@@ -1281,21 +1235,13 @@ async fn test_client_survives_dropped_incoming_receiver() {
 async fn test_client_driver_not_blocked_by_full_incoming_channel() {
     let broker_addr = start_test_broker().await;
 
-    let (sub_client, mut sub_rx) = connect(MqttOptions::new("slow-rx-client", broker_addr))
+    let (sub_client, _held_rx) = connect(MqttOptions::new("slow-rx-client", broker_addr))
         .await
         .unwrap();
     sub_client
         .subscribe("flood/in", QoS::AtMostOnce)
         .await
         .unwrap();
-    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(suback, Packet::SubAck { .. }));
-
-    // Teniamo vivo `sub_rx` ma non lo leggiamo più: la sua coda da 100 si riempirà.
-    let _held_rx = sub_rx;
 
     let (pub_client, _pub_rx) = connect(MqttOptions::new("flood-pub", broker_addr))
         .await
@@ -1383,11 +1329,6 @@ async fn test_large_publish_200kib_accepted_after_connect() {
         .subscribe("large/payload", QoS::AtMostOnce)
         .await
         .unwrap();
-    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(suback, Packet::SubAck { .. }));
 
     let (pub_client, _pub_rx) = connect(MqttOptions::new("pub-200k", broker_addr))
         .await
@@ -1411,6 +1352,65 @@ async fn test_large_publish_200kib_accepted_after_connect() {
             assert_eq!(topic, "large/payload");
             assert_eq!(got.len(), 200 * 1024);
             assert_eq!(got, payload);
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
+
+    pub_client.disconnect().await.unwrap();
+    sub_client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_client_subscribe_refused_and_valid_immediate_delivery() {
+    let broker_addr = start_test_broker().await;
+
+    let (sub_client, mut sub_rx) = connect(MqttOptions::new("sub-refuse-real", broker_addr))
+        .await
+        .unwrap();
+
+    // 1. Filtro invalido "a/#/b" -> SubscriptionRefused
+    let refused = timeout(
+        Duration::from_secs(2),
+        sub_client.subscribe("a/#/b", QoS::AtMostOnce),
+    )
+    .await
+    .expect("timeout su subscribe invalida");
+    assert!(
+        matches!(
+            refused,
+            Err(ferrite_client::ClientError::SubscriptionRefused)
+        ),
+        "atteso SubscriptionRefused per 'a/#/b', ottenuto {:?}",
+        refused
+    );
+
+    // 2. Subito dopo sulla stessa connessione, subscribe su "a/b" riesce e restituisce il QoS concesso.
+    let granted = timeout(
+        Duration::from_secs(2),
+        sub_client.subscribe("a/b", QoS::AtLeastOnce),
+    )
+    .await
+    .expect("timeout su subscribe valida")
+    .expect("subscribe valida fallita");
+    assert_eq!(granted, QoS::AtMostOnce);
+
+    // 3. Publish immediata da un altro client (senza sleep!) deve essere ricevuta.
+    let (pub_client, _pub_rx) = connect(MqttOptions::new("pub-immediate", broker_addr))
+        .await
+        .unwrap();
+    pub_client
+        .publish("a/b", Bytes::from_static(b"instant"))
+        .await
+        .unwrap();
+
+    let received = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .expect("timeout in attesa del PUBLISH immediato")
+        .expect("canale chiuso");
+    match received {
+        Packet::Publish { topic, payload, .. } => {
+            assert_eq!(topic, "a/b");
+            assert_eq!(payload, Bytes::from_static(b"instant"));
         }
         other => panic!("Expected Publish, got {:?}", other),
     }

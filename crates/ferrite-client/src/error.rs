@@ -18,6 +18,9 @@ pub enum ClientError {
     #[error("Connection closed by peer")]
     ConnectionClosed,
 
-    #[error("Acknowledgement channel dropped before receiving PUBACK")]
+    #[error("Acknowledgement channel dropped before receiving broker acknowledgement")]
     AckChannelDropped,
+
+    #[error("Subscription refused by broker (SUBACK Failure 0x80)")]
+    SubscriptionRefused,
 }

@@ -56,7 +56,7 @@ ferrite-protocol → ferrite-broker-core → ferrite-broker → ferrite-client �
 - [x] Pubblicazione a **QoS 0** via `publish(topic, payload)` (Fire & Forget).
 - [x] Pubblicazione a **QoS 1** via `publish_qos1(topic, payload)`: la chiamata si sblocca solo alla ricezione del `PUBACK` (pattern `oneshot` + tabella `pending_acks`).
 - [x] Packet ID in [1, 65535] generati con `fetch_update` (atomico, mai 0), condivisi da publish e subscribe.
-- [x] Registrazione sottoscrizioni via `subscribe(filter, qos)`.
+- [x] Registrazione sottoscrizioni via `subscribe(filter, qos)` con attesa del `SUBACK` e restituzione del `QoS` concesso (`ClientError::SubscriptionRefused` su `0x80`).
 - [x] Disconnessione pulita via `disconnect()`.
 - [x] Heartbeat periodico automatico con `tokio::time::interval` impostato sul 75% del keep-alive negoziato (con soglia minima per prevenire panic).
 - [ ] Risposta automatica `PUBACK` ai `PUBLISH` QoS 1 ricevuti: Fase 2.
