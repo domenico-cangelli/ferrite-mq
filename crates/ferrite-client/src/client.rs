@@ -1,7 +1,7 @@
 use crate::error::ClientError;
 use bytes::Bytes;
 use ferrite_protocol::{
-    ConnectReturnCode, MqttCodec, Packet, ProtocolVersion, QoS, SubscribeTopic,
+    ConnectReturnCode, MqttCodec, Packet, ProtocolVersion, QoS, SubAckReturnCode, SubscribeTopic,
 };
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -28,8 +28,10 @@ pub enum ClientCommand {
         ack_sender: oneshot::Sender<()>,
     },
     Subscribe {
+        packet_id: u16,
         filter: String,
         qos: QoS,
+        ack_sender: oneshot::Sender<Result<QoS, ClientError>>,
     },
     Unsubscribe {
         packet_id: u16,
@@ -39,7 +41,29 @@ pub enum ClientCommand {
     Disconnect,
 }
 
-/// Handle ad alto livello per interagire con il broker MQTT
+/// Tabelle delle richieste in volo del driver client (PUBACK, SUBACK, UNSUBACK).
+/// Centralizza la pulizia delle voci cancellate e la scelta di un packet ID libero
+/// su tutte e tre le tabelle in un unico punto (MQTT-2.3.1-2).
+#[derive(Default)]
+struct PendingTables {
+    pubacks: HashMap<u16, oneshot::Sender<()>>,
+    subacks: HashMap<u16, oneshot::Sender<Result<QoS, ClientError>>>,
+    unsubacks: HashMap<u16, oneshot::Sender<()>>,
+}
+
+impl PendingTables {
+    fn allocate_id(&mut self, counter: &AtomicU16, preferred: u16) -> Option<u16> {
+        self.pubacks.retain(|_, tx| !tx.is_closed());
+        self.subacks.retain(|_, tx| !tx.is_closed());
+        self.unsubacks.retain(|_, tx| !tx.is_closed());
+
+        free_packet_id(counter, preferred, |id| {
+            self.pubacks.contains_key(&id)
+                || self.subacks.contains_key(&id)
+                || self.unsubacks.contains_key(&id)
+        })
+    }
+}
 #[derive(Clone)]
 pub struct AsyncClient {
     command_tx: mpsc::Sender<ClientCommand>,
@@ -131,22 +155,27 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Sottoscrive un topic filter con il livello di QoS specificato
-    /// (versione provvisoria per TDD: non attende ancora il SUBACK).
+    /// Sottoscrive un topic filter con il livello di QoS specificato e attende il SUBACK dal broker,
+    /// restituendo il QoS effettivamente concesso oppure [`ClientError::SubscriptionRefused`].
     pub async fn subscribe<T: Into<String>>(
         &self,
         filter: T,
         qos: QoS,
     ) -> Result<QoS, ClientError> {
+        let packet_id = self.next_packet_id();
+        let (ack_tx, ack_rx) = oneshot::channel();
+
         self.command_tx
             .send(ClientCommand::Subscribe {
+                packet_id,
                 filter: filter.into(),
                 qos,
+                ack_sender: ack_tx,
             })
             .await
             .map_err(|_| ClientError::ChannelClosed)?;
 
-        Ok(qos)
+        ack_rx.await.map_err(|_| ClientError::AckChannelDropped)?
     }
 
     /// Annulla la sottoscrizione a un topic filter e attende il relativo UNSUBACK dal broker
@@ -274,10 +303,7 @@ async fn connect_with_timeout(
     };
 
     tokio::spawn(async move {
-        // Mappa dei pacchetti QoS 1 in volo in attesa di PUBACK
-        let mut pending_acks: HashMap<u16, oneshot::Sender<()>> = HashMap::new();
-        // Mappa delle richieste UNSUBSCRIBE in volo in attesa di UNSUBACK
-        let mut pending_unsubacks: HashMap<u16, oneshot::Sender<()>> = HashMap::new();
+        let mut pending = PendingTables::default();
 
         loop {
             tokio::select! {
@@ -310,16 +336,11 @@ async fn connect_with_timeout(
                             }
                         }
                         Some(ClientCommand::PublishQoS1 { packet_id, topic, payload, ack_sender }) => {
-                            pending_acks.retain(|_, tx| !tx.is_closed());
-                            pending_unsubacks.retain(|_, tx| !tx.is_closed());
-                            let Some(packet_id) = free_packet_id(&id_gen, packet_id, |id| {
-                                pending_acks.contains_key(&id)
-                                    || pending_unsubacks.contains_key(&id)
-                            }) else {
+                            let Some(packet_id) = pending.allocate_id(&id_gen, packet_id) else {
                                 warn!("Dropping PublishQoS1: all 65535 MQTT packet IDs are in flight");
                                 continue;
                             };
-                            pending_acks.insert(packet_id, ack_sender);
+                            pending.pubacks.insert(packet_id, ack_sender);
                             let packet = Packet::Publish {
                                 topic,
                                 qos: QoS::AtLeastOnce,
@@ -332,17 +353,17 @@ async fn connect_with_timeout(
                                 break;
                             }
                         }
-                        Some(ClientCommand::Subscribe { filter, qos }) => {
-                            pending_acks.retain(|_, tx| !tx.is_closed());
-                            pending_unsubacks.retain(|_, tx| !tx.is_closed());
-                            let preferred = next_id(&id_gen);
-                            let Some(packet_id) = free_packet_id(&id_gen, preferred, |id| {
-                                pending_acks.contains_key(&id)
-                                    || pending_unsubacks.contains_key(&id)
-                            }) else {
+                        Some(ClientCommand::Subscribe {
+                            packet_id,
+                            filter,
+                            qos,
+                            ack_sender,
+                        }) => {
+                            let Some(packet_id) = pending.allocate_id(&id_gen, packet_id) else {
                                 warn!("Dropping Subscribe: all 65535 MQTT packet IDs are in flight");
                                 continue;
                             };
+                            pending.subacks.insert(packet_id, ack_sender);
                             let packet = Packet::Subscribe {
                                 packet_id,
                                 topics: vec![SubscribeTopic { filter, qos }],
@@ -356,16 +377,11 @@ async fn connect_with_timeout(
                             filter,
                             ack_sender,
                         }) => {
-                            pending_acks.retain(|_, tx| !tx.is_closed());
-                            pending_unsubacks.retain(|_, tx| !tx.is_closed());
-                            let Some(packet_id) = free_packet_id(&id_gen, packet_id, |id| {
-                                pending_acks.contains_key(&id)
-                                    || pending_unsubacks.contains_key(&id)
-                            }) else {
+                            let Some(packet_id) = pending.allocate_id(&id_gen, packet_id) else {
                                 warn!("Dropping Unsubscribe: all 65535 MQTT packet IDs are in flight");
                                 continue;
                             };
-                            pending_unsubacks.insert(packet_id, ack_sender);
+                            pending.unsubacks.insert(packet_id, ack_sender);
                             let packet = Packet::Unsubscribe {
                                 packet_id,
                                 filters: vec![filter],
@@ -387,13 +403,38 @@ async fn connect_with_timeout(
                     match incoming {
                         Some(Ok(Packet::PubAck { packet_id })) => {
                             // Se un oneshot::Sender è registrato per questo ID, inviamo la notifica
-                            if let Some(ack_tx) = pending_acks.remove(&packet_id) {
+                            if let Some(ack_tx) = pending.pubacks.remove(&packet_id) {
                                 let _ = ack_tx.send(());
+                            }
+                        }
+                        Some(Ok(Packet::SubAck {
+                            packet_id,
+                            return_codes,
+                        })) => {
+                            // SUBACK è sempre consumato dal driver (anche se packet_id sconosciuto).
+                            if let Some(ack_tx) = pending.subacks.remove(&packet_id) {
+                                if return_codes.len() != 1 {
+                                    warn!(
+                                        "SUBACK for packet_id {} returned {} codes (expected 1), dropping ack",
+                                        packet_id,
+                                        return_codes.len()
+                                    );
+                                } else {
+                                    let result = match return_codes[0] {
+                                        SubAckReturnCode::SuccessQoS0 => Ok(QoS::AtMostOnce),
+                                        SubAckReturnCode::SuccessQoS1 => Ok(QoS::AtLeastOnce),
+                                        SubAckReturnCode::SuccessQoS2 => Ok(QoS::ExactlyOnce),
+                                        SubAckReturnCode::Failure => {
+                                            Err(ClientError::SubscriptionRefused)
+                                        }
+                                    };
+                                    let _ = ack_tx.send(result);
+                                }
                             }
                         }
                         Some(Ok(Packet::UnsubAck { packet_id })) => {
                             // Risolviamo il oneshot senza inoltrare UNSUBACK al canale incoming
-                            if let Some(ack_tx) = pending_unsubacks.remove(&packet_id) {
+                            if let Some(ack_tx) = pending.unsubacks.remove(&packet_id) {
                                 let _ = ack_tx.send(());
                             }
                         }
