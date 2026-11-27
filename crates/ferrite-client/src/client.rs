@@ -182,6 +182,12 @@ impl MqttOptions {
     }
 }
 
+/// Connette il client al broker MQTT e avvia il driver di rete in background.
+///
+/// Restituisce l'handle [`AsyncClient`] per inviare comandi e il ricevitore `mpsc::Receiver<Packet>`
+/// per i pacchetti in ingresso. Quando tutti gli handle `AsyncClient` (inclusi eventuali clone)
+/// vengono distrutti, il driver invia `DISCONNECT` al broker e termina, chiudendo anche il canale
+/// `incoming` (anche se il ricevitore è ancora tenuto vivo dal chiamante).
 pub async fn connect(
     options: MqttOptions,
 ) -> Result<(AsyncClient, mpsc::Receiver<Packet>), ClientError> {
@@ -254,9 +260,9 @@ async fn connect_with_timeout(
                     }
                 }
 
-                Some(cmd) = command_rx.recv() => {
+                cmd = command_rx.recv() => {
                     match cmd {
-                        ClientCommand::PublishQoS0 { topic, payload } => {
+                        Some(ClientCommand::PublishQoS0 { topic, payload }) => {
                             let packet = Packet::Publish {
                                 topic,
                                 qos: QoS::AtMostOnce,
@@ -269,7 +275,7 @@ async fn connect_with_timeout(
                                 break;
                             }
                         }
-                        ClientCommand::PublishQoS1 { packet_id, topic, payload, ack_sender } => {
+                        Some(ClientCommand::PublishQoS1 { packet_id, topic, payload, ack_sender }) => {
                             pending_acks.insert(packet_id, ack_sender);
                             let packet = Packet::Publish {
                                 topic,
@@ -283,7 +289,7 @@ async fn connect_with_timeout(
                                 break;
                             }
                         }
-                        ClientCommand::Subscribe { filter, qos } => {
+                        Some(ClientCommand::Subscribe { filter, qos }) => {
                             let packet_id = next_id(&id_gen);
                             let packet = Packet::Subscribe {
                                 packet_id,
@@ -293,11 +299,11 @@ async fn connect_with_timeout(
                                 break;
                             }
                         }
-                        ClientCommand::Unsubscribe {
+                        Some(ClientCommand::Unsubscribe {
                             packet_id,
                             filter,
                             ack_sender,
-                        } => {
+                        }) => {
                             pending_unsubacks.insert(packet_id, ack_sender);
                             let packet = Packet::Unsubscribe {
                                 packet_id,
@@ -307,31 +313,33 @@ async fn connect_with_timeout(
                                 break;
                             }
                         }
-                        ClientCommand::Disconnect => {
+                        Some(ClientCommand::Disconnect) | None => {
+                            // Tutti gli handle sono stati distrutti o è stato chiesto Disconnect:
+                            // inviamo DISCONNECT (MQTT-3.14.4-3) e terminiamo il driver.
                             let _ = framed.send(Packet::Disconnect).await;
                             break;
                         }
                     }
                 }
 
-                Some(incoming) = framed.next() => {
+                incoming = framed.next() => {
                     match incoming {
-                        Ok(Packet::PubAck { packet_id }) => {
+                        Some(Ok(Packet::PubAck { packet_id })) => {
                             // Se un oneshot::Sender è registrato per questo ID, inviamo la notifica
                             if let Some(ack_tx) = pending_acks.remove(&packet_id) {
                                 let _ = ack_tx.send(());
                             }
                         }
-                        Ok(Packet::UnsubAck { packet_id }) => {
+                        Some(Ok(Packet::UnsubAck { packet_id })) => {
                             // Risolviamo il oneshot senza inoltrare UNSUBACK al canale incoming
                             if let Some(ack_tx) = pending_unsubacks.remove(&packet_id) {
                                 let _ = ack_tx.send(());
                             }
                         }
-                        Ok(Packet::PingResp) => {
+                        Some(Ok(Packet::PingResp)) => {
                             // PINGRESP è un dettaglio interno del keep-alive: consumato dal driver.
                         }
-                        Ok(packet) => {
+                        Some(Ok(packet)) => {
                             // TODO(Fase 2, #15): con QoS 1 in ingresso non si può scartare prima del PUBACK.
                             match incoming_tx.try_send(packet) {
                                 Ok(()) => {}
@@ -345,11 +353,9 @@ async fn connect_with_timeout(
                                 }
                             }
                         }
-                        Err(_) => break,
+                        Some(Err(_)) | None => break,
                     }
                 }
-
-                else => break,
             }
         }
     });
