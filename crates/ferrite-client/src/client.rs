@@ -182,6 +182,8 @@ impl MqttOptions {
     }
 }
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Connette il client al broker MQTT e avvia il driver di rete in background.
 ///
 /// Restituisce l'handle [`AsyncClient`] per inviare comandi e il ricevitore `mpsc::Receiver<Packet>`
@@ -191,44 +193,52 @@ impl MqttOptions {
 pub async fn connect(
     options: MqttOptions,
 ) -> Result<(AsyncClient, mpsc::Receiver<Packet>), ClientError> {
-    connect_with_timeout(options, Duration::from_secs(10)).await
+    connect_with_timeout(options, CONNECT_TIMEOUT).await
 }
 
-/// Versione provvisoria per TDD: non applica ancora il timeout.
 async fn connect_with_timeout(
     options: MqttOptions,
-    _connect_timeout: Duration,
+    connect_timeout: Duration,
 ) -> Result<(AsyncClient, mpsc::Receiver<Packet>), ClientError> {
-    let stream = TcpStream::connect(options.broker_addr).await?;
-    let mut framed = Framed::new(stream, MqttCodec::default());
-
+    let broker_addr = options.broker_addr;
+    let keep_alive = options.keep_alive;
     let connect_packet = Packet::Connect {
         protocol_version: ProtocolVersion::Mqtt311,
         clean_session: options.clean_session,
-        keep_alive: options.keep_alive,
+        keep_alive,
         client_id: options.client_id,
         will: None,
         username: None,
         password: None,
     };
-    framed.send(connect_packet).await?;
 
-    match framed.next().await {
-        Some(Ok(Packet::ConnAck {
-            return_code: ConnectReturnCode::Accepted,
-            ..
-        })) => {}
-        Some(Ok(Packet::ConnAck { return_code, .. })) => {
-            return Err(ClientError::ConnectionRefused(return_code));
-        }
-        Some(Ok(_unexpected)) => {
-            return Err(ClientError::Protocol(
+    let mut framed = tokio::time::timeout(connect_timeout, async {
+        let stream = TcpStream::connect(broker_addr).await?;
+        let mut framed = Framed::new(stream, MqttCodec::default());
+        framed.send(connect_packet).await?;
+
+        match framed.next().await {
+            Some(Ok(Packet::ConnAck {
+                return_code: ConnectReturnCode::Accepted,
+                ..
+            })) => Ok(framed),
+            Some(Ok(Packet::ConnAck { return_code, .. })) => {
+                Err(ClientError::ConnectionRefused(return_code))
+            }
+            Some(Ok(_unexpected)) => Err(ClientError::Protocol(
                 ferrite_protocol::ProtocolError::InvalidPacketType(0),
-            ));
+            )),
+            Some(Err(e)) => Err(ClientError::Protocol(e)),
+            None => Err(ClientError::ConnectionClosed),
         }
-        Some(Err(e)) => return Err(ClientError::Protocol(e)),
-        None => return Err(ClientError::ConnectionClosed),
-    }
+    })
+    .await
+    .map_err(|_| {
+        ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "connect timeout",
+        ))
+    })??;
 
     let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(100);
     let (incoming_tx, incoming_rx) = mpsc::channel::<Packet>(100);
