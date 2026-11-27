@@ -1602,3 +1602,106 @@ async fn test_broker_config_max_packet_size_1024_rejects_2000_byte_connect_heade
         .expect("il broker non ha chiuso subito il CONNECT da 2000 byte con max_packet_size=1024");
     assert!(closed.is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_subscriber_receives_pingresp_under_continuous_outbound_flood() {
+    use bytes::BytesMut;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::codec::Encoder;
+
+    let broker_addr = start_test_broker().await;
+
+    // Subscriber S con socket grezzo iscritto a "flood/#"
+    let mut sub = raw_connect(broker_addr, "sub-starve", 60).await;
+    sub.send(Packet::Subscribe {
+        packet_id: 1,
+        topics: vec![ferrite_protocol::SubscribeTopic {
+            filter: "flood/#".into(),
+            qos: QoS::AtMostOnce,
+        }],
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), sub.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Packet::SubAck { .. }
+    ));
+
+    let (mut sub_sink, mut sub_stream) = sub.split();
+    let (pingresp_tx, mut pingresp_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+    // Task lettore continuo di S: svuota il socket e notifica ogni PINGRESP.
+    let reader_task = tokio::spawn(async move {
+        while let Some(Ok(pkt)) = sub_stream.next().await {
+            if pkt == Packet::PingResp {
+                let _ = pingresp_tx.send(());
+            }
+        }
+    });
+
+    // Pre-codifichiamo un batch di 64 PUBLISH piccoli così i publisher saturano la coda `rx` di S.
+    let mut codec = MqttCodec::default();
+    let mut batch = BytesMut::new();
+    for _ in 0..64 {
+        codec
+            .encode(
+                Packet::Publish {
+                    topic: "flood/x".into(),
+                    qos: QoS::AtMostOnce,
+                    retain: false,
+                    dup: false,
+                    packet_id: None,
+                    payload: Bytes::from_static(b"1234567890"),
+                },
+                &mut batch,
+            )
+            .unwrap();
+    }
+    let batch_bytes = batch.freeze();
+
+    // 4 publisher in ciclo stretto su "flood/x" per mantenere sempre piena la coda in uscita di S.
+    let mut pub_tasks = Vec::new();
+    for i in 0..4u32 {
+        let pub_framed = raw_connect(broker_addr, &format!("flood-pub-{i}"), 60).await;
+        let mut pub_stream = pub_framed.into_inner();
+        let bytes_clone = batch_bytes.clone();
+        pub_tasks.push(tokio::spawn(async move {
+            while pub_stream.write_all(&bytes_clone).await.is_ok() {}
+        }));
+    }
+
+    // Diamo ai publisher un attimo per saturare la coda in uscita di S.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Mentre il flood è attivo, S invia 5 PINGREQ e deve ricevere 5 PINGRESP entro 2s ciascuno.
+    let ping_result: Result<(), String> = async {
+        for round in 1..=5 {
+            timeout(Duration::from_secs(2), sub_sink.send(Packet::PingReq))
+                .await
+                .map_err(|_| format!("round {round}: timeout invio PINGREQ"))?
+                .map_err(|e| format!("round {round}: errore invio PINGREQ: {e:?}"))?;
+
+            timeout(Duration::from_secs(2), pingresp_rx.recv())
+                .await
+                .map_err(|_| {
+                    format!("round {round}: timeout in attesa di PINGRESP sotto flood (starvation)")
+                })?
+                .ok_or_else(|| format!("round {round}: reader di S chiuso inaspettatamente"))?;
+        }
+        Ok(())
+    }
+    .await;
+
+    for task in pub_tasks {
+        task.abort();
+    }
+    reader_task.abort();
+
+    if let Err(msg) = ping_result {
+        panic!("{msg}");
+    }
+}
