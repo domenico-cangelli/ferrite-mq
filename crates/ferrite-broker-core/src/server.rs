@@ -17,6 +17,9 @@ use tracing::{error, info, warn};
 type ClientSender = mpsc::Sender<Packet>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Pausa dopo un errore di `TcpListener::accept()` (es. EMFILE) per evitare busy-loop al 100% di CPU.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
 /// Tempo massimo concesso al client per inviare il pacchetto `CONNECT` iniziale.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -222,6 +225,7 @@ pub async fn run_server(listener: TcpListener) -> Result<(), BoxError> {
             }
             Err(e) => {
                 warn!("TCP accept error: {:?}", e);
+                sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
