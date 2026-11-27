@@ -78,19 +78,24 @@ async fn test_pub_sub_roundtrip() {
 async fn test_client_automatic_pingreq() {
     let broker_addr = start_test_broker().await;
 
-    // Impostiamo un keep_alive brevissimo (1 secondo)
+    // Impostiamo un keep_alive brevissimo (1 secondo -> watchdog broker = 1.5s)
     let mut opts = MqttOptions::new("ping-client", broker_addr);
     opts.keep_alive = 1;
 
-    let (_client, mut incoming_rx) = connect(opts).await.expect("Connection failed");
+    let (client, _incoming_rx) = connect(opts).await.expect("Connection failed");
 
-    // In 2 secondi, il client deve aver emesso almeno un PINGREQ e aver ricevuto PINGRESP dal broker
-    let packet = timeout(Duration::from_secs(2), incoming_rx.recv())
-        .await
-        .expect("Timeout waiting for PINGRESP")
-        .expect("Channel closed");
+    // Attendiamo 2.2s (> 1.5s di watchdog): senza PINGREQ automatici il broker avrebbe chiuso.
+    tokio::time::sleep(Duration::from_millis(2200)).await;
 
-    assert_eq!(packet, Packet::PingResp);
+    timeout(
+        Duration::from_secs(2),
+        client.publish_qos1("ping/alive", Bytes::from_static(b"ok")),
+    )
+    .await
+    .expect("Timeout waiting for PUBACK: automatic PINGREQ failed to keep connection alive")
+    .expect("publish_qos1 failed");
+
+    client.disconnect().await.unwrap();
 }
 
 #[tokio::test]
