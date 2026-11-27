@@ -63,12 +63,25 @@ fn next_id(counter: &AtomicU16) -> u16 {
         .expect("la closure restituisce sempre Some")
 }
 
-/// Versione provvisoria per TDD: non controlla ancora `is_busy`.
-fn free_packet_id<F>(_counter: &AtomicU16, preferred: u16, _is_busy: F) -> Option<u16>
+/// Sceglie un Packet ID libero nell'intervallo [1, 65535] che non risulti occupato da `is_busy`.
+///
+/// Se `preferred` è valido (!= 0) e libero, lo restituisce subito. Altrimenti avanza `counter`
+/// con `next_id` (che salta sempre lo 0) al massimo 65535 volte. Ritorna `None` se tutti gli
+/// ID sono attualmente in volo (MQTT-2.3.1-2).
+fn free_packet_id<F>(counter: &AtomicU16, preferred: u16, is_busy: F) -> Option<u16>
 where
     F: Fn(u16) -> bool,
 {
-    Some(preferred)
+    if preferred != 0 && !is_busy(preferred) {
+        return Some(preferred);
+    }
+    for _ in 0..u16::MAX {
+        let candidate = next_id(counter);
+        if !is_busy(candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 impl AsyncClient {
@@ -292,6 +305,15 @@ async fn connect_with_timeout(
                             }
                         }
                         Some(ClientCommand::PublishQoS1 { packet_id, topic, payload, ack_sender }) => {
+                            pending_acks.retain(|_, tx| !tx.is_closed());
+                            pending_unsubacks.retain(|_, tx| !tx.is_closed());
+                            let Some(packet_id) = free_packet_id(&id_gen, packet_id, |id| {
+                                pending_acks.contains_key(&id)
+                                    || pending_unsubacks.contains_key(&id)
+                            }) else {
+                                warn!("Dropping PublishQoS1: all 65535 MQTT packet IDs are in flight");
+                                continue;
+                            };
                             pending_acks.insert(packet_id, ack_sender);
                             let packet = Packet::Publish {
                                 topic,
@@ -306,7 +328,16 @@ async fn connect_with_timeout(
                             }
                         }
                         Some(ClientCommand::Subscribe { filter, qos }) => {
-                            let packet_id = next_id(&id_gen);
+                            pending_acks.retain(|_, tx| !tx.is_closed());
+                            pending_unsubacks.retain(|_, tx| !tx.is_closed());
+                            let preferred = next_id(&id_gen);
+                            let Some(packet_id) = free_packet_id(&id_gen, preferred, |id| {
+                                pending_acks.contains_key(&id)
+                                    || pending_unsubacks.contains_key(&id)
+                            }) else {
+                                warn!("Dropping Subscribe: all 65535 MQTT packet IDs are in flight");
+                                continue;
+                            };
                             let packet = Packet::Subscribe {
                                 packet_id,
                                 topics: vec![SubscribeTopic { filter, qos }],
@@ -320,6 +351,15 @@ async fn connect_with_timeout(
                             filter,
                             ack_sender,
                         }) => {
+                            pending_acks.retain(|_, tx| !tx.is_closed());
+                            pending_unsubacks.retain(|_, tx| !tx.is_closed());
+                            let Some(packet_id) = free_packet_id(&id_gen, packet_id, |id| {
+                                pending_acks.contains_key(&id)
+                                    || pending_unsubacks.contains_key(&id)
+                            }) else {
+                                warn!("Dropping Unsubscribe: all 65535 MQTT packet IDs are in flight");
+                                continue;
+                            };
                             pending_unsubacks.insert(packet_id, ack_sender);
                             let packet = Packet::Unsubscribe {
                                 packet_id,
