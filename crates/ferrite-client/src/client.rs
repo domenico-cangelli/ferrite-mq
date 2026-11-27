@@ -1261,6 +1261,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_incoming_qos1_dropped_receiver_drains_non_empty_backlog_in_order() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (drop_rx_tx, drop_rx_rx) = oneshot::channel::<()>();
+        let (drained_tx, drained_rx) = oneshot::channel::<()>();
+
+        let broker = tokio::spawn(async move {
+            let mut framed = accept_and_connack(&listener).await;
+
+            // Invia 150 PUBLISH QoS 1: 100 entrano nel canale incoming, 50 restano nel backlog.
+            for id in 1..=150u16 {
+                framed
+                    .feed(Packet::Publish {
+                        topic: "t/drop-backlog".into(),
+                        qos: QoS::AtLeastOnce,
+                        retain: false,
+                        dup: false,
+                        packet_id: Some(id),
+                        payload: Bytes::from_static(b"x"),
+                    })
+                    .await
+                    .unwrap();
+            }
+            framed.flush().await.unwrap();
+
+            // Riceve i primi 100 PUBACK in ordine.
+            for expected_id in 1..=100u16 {
+                let ack = tokio::time::timeout(Duration::from_secs(2), framed.next())
+                    .await
+                    .unwrap_or_else(|_| panic!("timeout in attesa di PUBACK #{expected_id}"))
+                    .expect("connessione chiusa")
+                    .expect("errore codec");
+                assert_eq!(
+                    ack,
+                    Packet::PubAck {
+                        packet_id: expected_id
+                    }
+                );
+            }
+
+            // Per 200 ms non deve arrivare nessun altro PUBACK finché incoming_rx è vivo.
+            let premature = tokio::time::timeout(Duration::from_millis(200), framed.next()).await;
+            assert!(
+                premature.is_err(),
+                "ricevuto PUBACK #101 prima che incoming_rx venisse scartato: {:?}",
+                premature
+            );
+
+            // Chiediamo al test di scartare incoming_rx: devono arrivare i PUBACK 101..=150 in ordine.
+            let _ = drop_rx_tx.send(());
+            for expected_id in 101..=150u16 {
+                let ack = tokio::time::timeout(Duration::from_secs(2), framed.next())
+                    .await
+                    .unwrap_or_else(|_| panic!("timeout in attesa di PUBACK #{expected_id}"))
+                    .expect("connessione chiusa")
+                    .expect("errore codec");
+                assert_eq!(
+                    ack,
+                    Packet::PubAck {
+                        packet_id: expected_id
+                    }
+                );
+            }
+            let _ = drained_tx.send(());
+
+            // Dopo lo svuotamento il driver resta attivo e completa publish_qos1.
+            let pkt = tokio::time::timeout(Duration::from_secs(2), framed.next())
+                .await
+                .expect("timeout in attesa del PUBLISH QoS 1 dal client")
+                .expect("connessione chiusa")
+                .expect("errore codec");
+            let out_id = match pkt {
+                Packet::Publish {
+                    topic,
+                    qos: QoS::AtLeastOnce,
+                    packet_id: Some(id),
+                    ..
+                } => {
+                    assert_eq!(topic, "out/after-drain");
+                    id
+                }
+                other => panic!("atteso Publish QoS 1, ottenuto {:?}", other),
+            };
+            framed
+                .send(Packet::PubAck { packet_id: out_id })
+                .await
+                .unwrap();
+
+            let _ = framed.next().await;
+        });
+
+        let (client, incoming_rx) = connect(MqttOptions::new("q1-drop-nonempty", addr))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), drop_rx_rx)
+            .await
+            .expect("broker non ha segnalato lo scarto del receiver")
+            .unwrap();
+        drop(incoming_rx);
+
+        tokio::time::timeout(Duration::from_secs(3), drained_rx)
+            .await
+            .expect("backlog non svuotato dopo scarto di incoming_rx")
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.publish_qos1("out/after-drain", Bytes::from_static(b"ok")),
+        )
+        .await
+        .expect("timeout su publish_qos1 dopo svuotamento backlog")
+        .expect("publish_qos1 fallita");
+
+        drop(client);
+        broker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_incoming_qos1_backlog_overflow_closes_connection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1269,21 +1389,27 @@ mod tests {
             let framed = accept_and_connack(&listener).await;
             let (mut sink, mut stream) = framed.split();
 
-            // Dreniamo in parallelo i PUBACK (primi 100) così il socket del client non si blocca.
+            // Dreniamo in parallelo i primi 100 PUBACK (quelli entrati nel canale incoming)
+            // così il socket del client non si blocca durante l'invio dei 1100 messaggi.
             let reader = tokio::spawn(async move {
-                loop {
-                    match tokio::time::timeout(Duration::from_secs(3), stream.next()).await {
-                        Ok(Some(Ok(Packet::PubAck { .. }))) => continue,
-                        Ok(None) | Ok(Some(Err(_))) => return true,
-                        Ok(Some(Ok(_))) => continue,
-                        Err(_) => return false,
-                    }
+                for expected_id in 1..=100u16 {
+                    let ack = tokio::time::timeout(Duration::from_secs(3), stream.next())
+                        .await
+                        .unwrap_or_else(|_| panic!("timeout in attesa di PUBACK #{expected_id}"))
+                        .expect("connessione chiusa prematuramente durante i primi 100 PUBACK")
+                        .expect("errore codec");
+                    assert_eq!(
+                        ack,
+                        Packet::PubAck {
+                            packet_id: expected_id
+                        }
+                    );
                 }
+                stream
             });
 
-            // Inviamo 100 (canale) + 1000 (MAX_QOS1_BACKLOG) + 1 = 1101 PUBLISH QoS 1 non letti.
-            let mut write_closed = false;
-            for id in 1..=1101u16 {
+            // Inviamo esattamente 100 (canale) + 1000 (MAX_QOS1_BACKLOG) = 1100 PUBLISH QoS 1.
+            for id in 1..=1100u16 {
                 let pkt = Packet::Publish {
                     topic: "t/overflow".into(),
                     qos: QoS::AtLeastOnce,
@@ -1292,23 +1418,46 @@ mod tests {
                     packet_id: Some(id),
                     payload: Bytes::from_static(b"x"),
                 };
-                if sink.feed(pkt).await.is_err() {
-                    write_closed = true;
-                    break;
-                }
-                if id % 64 == 0 && sink.flush().await.is_err() {
-                    write_closed = true;
-                    break;
+                sink.feed(pkt)
+                    .await
+                    .unwrap_or_else(|e| panic!("scrittura chiusa al messaggio #{id}: {e:?}"));
+                if id % 64 == 0 {
+                    sink.flush()
+                        .await
+                        .unwrap_or_else(|e| panic!("flush fallito al messaggio #{id}: {e:?}"));
                 }
             }
-            if !write_closed && sink.flush().await.is_err() {
-                write_closed = true;
-            }
+            sink.flush()
+                .await
+                .expect("flush fallito dopo 1100 messaggi");
 
-            let read_closed = reader.await.unwrap();
+            let mut stream = reader.await.unwrap();
+
+            // Dopo 1100 messaggi la connessione deve restare aperta per almeno 500 ms.
+            let premature = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
+            assert!(
+                premature.is_err(),
+                "la connessione si è chiusa o ha emesso dati inattesi dopo 1100 messaggi: {:?}",
+                premature
+            );
+
+            // Il messaggio 1101 supera MAX_QOS1_BACKLOG e deve chiudere la connessione entro 2 s.
+            let pkt_1101 = Packet::Publish {
+                topic: "t/overflow".into(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                dup: false,
+                packet_id: Some(1101),
+                payload: Bytes::from_static(b"x"),
+            };
+            let write_closed = sink.send(pkt_1101).await.is_err();
+            let read_closed = matches!(
+                tokio::time::timeout(Duration::from_secs(2), stream.next()).await,
+                Ok(None) | Ok(Some(Err(_)))
+            );
             assert!(
                 read_closed || write_closed,
-                "il client non ha chiuso la connessione dopo overflow del backlog QoS 1 (> 1100)"
+                "il client non ha chiuso la connessione entro 2s dopo il messaggio 1101"
             );
         });
 
