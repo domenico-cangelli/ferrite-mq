@@ -6,6 +6,7 @@ use std::str;
 use tokio_util::codec::{Decoder, Encoder};
 
 const DEFAULT_MAX_PACKET_SIZE: usize = 2 * 1024 * 1024;
+const MAX_EAGER_RESERVE: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct MqttCodec {
@@ -87,7 +88,7 @@ impl Decoder for MqttCodec {
         let total_packet_len = fixed_header_len + remaining_length;
 
         if src.len() < total_packet_len {
-            src.reserve(total_packet_len - src.len());
+            src.reserve((total_packet_len - src.len()).min(MAX_EAGER_RESERVE));
             return Ok(None);
         }
 
@@ -1376,5 +1377,25 @@ mod tests {
             Err(ProtocolError::UnsupportedProtocolLevel(5))
         ));
         assert_eq!(&dst[..], initial_prefix);
+    }
+
+    #[test]
+    fn test_decoder_caps_eager_reserve_on_incomplete_large_frame() {
+        let mut codec = MqttCodec::default();
+        let mut buf = BytesMut::new();
+
+        // Fixed header di un PUBLISH QoS 0 che dichiara 1 MiB (1_048_576 byte) di corpo,
+        // senza inviare alcun byte del corpo.
+        buf.put_u8(0x30);
+        let mut varint = Vec::with_capacity(4);
+        encode_varint(1024 * 1024, &mut varint).unwrap();
+        buf.put_slice(&varint);
+
+        assert_eq!(codec.decode(&mut buf).unwrap(), None);
+        assert!(
+            buf.capacity() < 16 * 1024,
+            "il decoder ha prenotato troppa memoria prima di ricevere il corpo: capacity={}",
+            buf.capacity()
+        );
     }
 }

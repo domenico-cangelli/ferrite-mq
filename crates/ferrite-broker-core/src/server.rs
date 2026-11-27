@@ -17,8 +17,14 @@ use tracing::{error, info, warn};
 type ClientSender = mpsc::Sender<Packet>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Pausa dopo un errore di `TcpListener::accept()` (es. EMFILE) per evitare busy-loop al 100% di CPU.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
 /// Tempo massimo concesso al client per inviare il pacchetto `CONNECT` iniziale.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Dimensione massima accettata per il pacchetto `CONNECT` iniziale (prima dell'autenticazione).
+const PRE_CONNECT_MAX_PACKET_SIZE: usize = 64 * 1024;
 
 /// Tempo massimo concesso per scrivere un pacchetto sul socket di un client.
 /// Se il client non legge e il buffer TCP resta pieno oltre questa soglia,
@@ -219,6 +225,7 @@ pub async fn run_server(listener: TcpListener) -> Result<(), BoxError> {
             }
             Err(e) => {
                 warn!("TCP accept error: {:?}", e);
+                sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
@@ -230,7 +237,9 @@ async fn handle_client(
     state: BrokerState,
     connect_timeout: Duration,
 ) -> Result<(), BoxError> {
-    let mut framed = Framed::new(stream, MqttCodec::default());
+    // Prima del CONNECT applichiamo un limite stretto (64 KiB) per ridurre il costo
+    // delle connessioni anonime non ancora identificate.
+    let mut framed = Framed::new(stream, MqttCodec::new(PRE_CONNECT_MAX_PACKET_SIZE));
 
     // 1. Handshake iniziale: il primo pacchetto deve essere un CONNECT entro connect_timeout
     let (raw_client_id, clean_session, keep_alive) =
@@ -328,6 +337,8 @@ async fn handle_client(
     // 3. Da qui in poi qualsiasi errore (anche propagato con `?`) deve comunque
     // passare dalla pulizia: per questo il ciclo vive in un blocco separato e la
     // pulizia sta dopo, fuori dal blocco. Rust non ha `finally`.
+    // Dopo il CONNECT accettato ripristiniamo il limite standard del codec (2 MiB).
+    *framed.codec_mut() = MqttCodec::default();
     let mut subscribed_filters: HashSet<String> = HashSet::new();
     let result = async {
         send_with_timeout(
