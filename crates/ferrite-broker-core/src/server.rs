@@ -419,11 +419,17 @@ async fn session_loop(
     tokio::pin!(inactivity);
 
     loop {
-        tokio::select! {
-            // Ordine deterministico: la chiusura del canale (takeover) deve sempre vincere
-            // sui pacchetti in arrivo già pronti nel buffer del socket.
-            biased;
+        // Priorità al takeover senza affamare `framed.next()` o il watchdog: se il Sender
+        // della sessione è stato chiuso da una nuova connessione, usciamo subito.
+        if rx.is_closed() {
+            info!(
+                "Client [{}] replaced by a new connection with the same client_id",
+                client_id
+            );
+            return Ok(());
+        }
 
+        tokio::select! {
             // Messaggi in uscita dalla coda interna (es. pubblicazioni di altri client)
             outgoing = rx.recv() => {
                 match outgoing {
