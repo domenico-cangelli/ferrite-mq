@@ -6,6 +6,7 @@ use std::str;
 use tokio_util::codec::{Decoder, Encoder};
 
 const DEFAULT_MAX_PACKET_SIZE: usize = 2 * 1024 * 1024;
+const MAX_EAGER_RESERVE: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct MqttCodec {
@@ -87,7 +88,7 @@ impl Decoder for MqttCodec {
         let total_packet_len = fixed_header_len + remaining_length;
 
         if src.len() < total_packet_len {
-            src.reserve(total_packet_len - src.len());
+            src.reserve((total_packet_len - src.len()).min(MAX_EAGER_RESERVE));
             return Ok(None);
         }
 
