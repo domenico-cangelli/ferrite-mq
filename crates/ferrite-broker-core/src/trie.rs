@@ -225,7 +225,15 @@ impl TopicTrie {
         }
     }
     /// Rimuove la sottoscrizione di un client a uno specifico topic filter.
+    /// Se il filtro è invalido non modifica il trie e registra un `warn!`.
     pub fn unsubscribe(&mut self, topic_filter: &str, client_id: &str) {
+        if let Err(err) = validate_filter(topic_filter) {
+            warn!(
+                "Ignoring invalid unsubscribe topic filter {:?}: {}",
+                topic_filter, err
+            );
+            return;
+        }
         let tokens: Vec<&str> = topic_filter.split('/').collect();
         Self::remove_recursive(&mut self.root, &tokens, 0, client_id);
     }

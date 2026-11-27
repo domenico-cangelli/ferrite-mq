@@ -1,4 +1,4 @@
-use crate::trie::{validate_topic_name, TopicTrie};
+use crate::trie::{validate_filter, validate_topic_name, TopicTrie};
 use ferrite_protocol::{
     ConnectReturnCode, MqttCodec, Packet, ProtocolError, QoS, SubAckReturnCode, SubscribeTopic,
 };
@@ -523,6 +523,15 @@ async fn session_loop(
                                 client_id
                             );
                             return Ok(());
+                        }
+                        for filter in &filters {
+                            if let Err(err) = validate_filter(filter) {
+                                warn!(
+                                    "[{}] Received UNSUBSCRIBE with invalid filter {:?} ({}), protocol violation (MQTT-4.8.0-1), closing",
+                                    client_id, filter, err
+                                );
+                                return Ok(());
+                            }
                         }
                         if unsubscribe_if_owner(
                             state,
