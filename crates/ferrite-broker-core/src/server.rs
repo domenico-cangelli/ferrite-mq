@@ -230,25 +230,21 @@ impl BrokerState {
     }
 }
 
-/// Avvia il broker con la configurazione specificata.
-/// (Versione provvisoria per TDD: ignora ancora `config` e delega a `run_server`.)
+/// Avvia il broker MQTT sul `TcpListener` fornito usando la configurazione [`BrokerConfig`] specificata.
 pub async fn run_server_with_config(
     listener: TcpListener,
-    _config: BrokerConfig,
+    config: BrokerConfig,
 ) -> Result<(), BoxError> {
-    run_server(listener).await
-}
-
-pub async fn run_server(listener: TcpListener) -> Result<(), BoxError> {
     let state = BrokerState::default();
 
     loop {
         match listener.accept().await {
             Ok((socket, peer_addr)) => {
                 let state_clone = state.clone();
+                let config_clone = config.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_client(socket, peer_addr, state_clone, CONNECT_TIMEOUT).await
+                        handle_client(socket, peer_addr, state_clone, config_clone).await
                     {
                         error!("Connection error with {}: {:?}", peer_addr, e);
                     }
@@ -262,19 +258,25 @@ pub async fn run_server(listener: TcpListener) -> Result<(), BoxError> {
     }
 }
 
+/// Avvia il broker MQTT con la configurazione predefinita ([`BrokerConfig::default`]).
+pub async fn run_server(listener: TcpListener) -> Result<(), BoxError> {
+    run_server_with_config(listener, BrokerConfig::default()).await
+}
+
 async fn handle_client(
     stream: TcpStream,
     peer_addr: SocketAddr,
     state: BrokerState,
-    connect_timeout: Duration,
+    config: BrokerConfig,
 ) -> Result<(), BoxError> {
-    // Prima del CONNECT applichiamo un limite stretto (64 KiB) per ridurre il costo
-    // delle connessioni anonime non ancora identificate.
-    let mut framed = Framed::new(stream, MqttCodec::new(PRE_CONNECT_MAX_PACKET_SIZE));
+    // Prima del CONNECT applichiamo il minore tra 64 KiB e `config.max_packet_size`
+    // per ridurre il costo delle connessioni anonime non ancora identificate.
+    let pre_connect_limit = PRE_CONNECT_MAX_PACKET_SIZE.min(config.max_packet_size);
+    let mut framed = Framed::new(stream, MqttCodec::new(pre_connect_limit));
 
-    // 1. Handshake iniziale: il primo pacchetto deve essere un CONNECT entro connect_timeout
+    // 1. Handshake iniziale: il primo pacchetto deve essere un CONNECT entro config.connect_timeout
     let (raw_client_id, clean_session, keep_alive) =
-        match timeout(connect_timeout, framed.next()).await {
+        match timeout(config.connect_timeout, framed.next()).await {
             Ok(Some(Ok(Packet::Connect {
                 client_id,
                 clean_session,
@@ -368,8 +370,8 @@ async fn handle_client(
     // 3. Da qui in poi qualsiasi errore (anche propagato con `?`) deve comunque
     // passare dalla pulizia: per questo il ciclo vive in un blocco separato e la
     // pulizia sta dopo, fuori dal blocco. Rust non ha `finally`.
-    // Dopo il CONNECT accettato ripristiniamo il limite standard del codec (2 MiB).
-    *framed.codec_mut() = MqttCodec::default();
+    // Dopo il CONNECT accettato applichiamo il limite configurato per la sessione.
+    *framed.codec_mut() = MqttCodec::new(config.max_packet_size);
     let mut subscribed_filters: HashSet<String> = HashSet::new();
     let result = async {
         send_with_timeout(
@@ -800,7 +802,11 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let (socket, peer_addr) = listener.accept().await.unwrap();
-            let _ = handle_client(socket, peer_addr, state, Duration::from_millis(100)).await;
+            let config = BrokerConfig {
+                connect_timeout: Duration::from_millis(100),
+                ..Default::default()
+            };
+            let _ = handle_client(socket, peer_addr, state, config).await;
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -875,5 +881,34 @@ mod tests {
         assert_eq!(res_new, Some(()));
         assert!(state.trie.read().await.match_topic("x/y").is_empty());
         assert!(new_filters.is_empty());
+    }
+
+    #[test]
+    fn test_default_broker_config_matches_codec_default_max_packet_size() {
+        use bytes::{BufMut, BytesMut};
+        use ferrite_protocol::varint::encode_varint;
+        use tokio_util::codec::Decoder;
+
+        let default_max = BrokerConfig::default().max_packet_size;
+        let mut codec = MqttCodec::default();
+
+        // Esattamente default_max: accettato (Ok(None) perché manca il corpo).
+        let mut exact = BytesMut::new();
+        exact.put_u8(0x30);
+        let mut varint = Vec::with_capacity(4);
+        encode_varint(default_max, &mut varint).unwrap();
+        exact.put_slice(&varint);
+        assert_eq!(codec.decode(&mut exact).unwrap(), None);
+
+        // default_max + 1: rifiutato da MqttCodec::default() con PacketTooLarge.
+        let mut over = BytesMut::new();
+        over.put_u8(0x30);
+        varint.clear();
+        encode_varint(default_max + 1, &mut varint).unwrap();
+        over.put_slice(&varint);
+        assert!(matches!(
+            codec.decode(&mut over),
+            Err(ProtocolError::PacketTooLarge)
+        ));
     }
 }
