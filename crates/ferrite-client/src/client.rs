@@ -4,7 +4,7 @@ use ferrite_protocol::{
     ConnectReturnCode, MqttCodec, Packet, ProtocolVersion, QoS, SubAckReturnCode, SubscribeTopic,
 };
 use futures::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
@@ -230,6 +230,7 @@ impl MqttOptions {
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_QOS1_BACKLOG: usize = 1000;
 
 /// Connette il client al broker MQTT e avvia il driver di rete in background.
 ///
@@ -237,6 +238,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// per i pacchetti in ingresso. Quando tutti gli handle `AsyncClient` (inclusi eventuali clone)
 /// vengono distrutti, il driver invia `DISCONNECT` al broker e termina, chiudendo anche il canale
 /// `incoming` (anche se il ricevitore è ancora tenuto vivo dal chiamante).
+///
+/// Per i `PUBLISH` in ingresso a QoS 1 il driver invia `PUBACK` solo dopo la consegna nel canale
+/// `incoming` (in ordine FIFO, usando un backlog interno limitato se il canale è pieno; se il
+/// backlog supera il limite, chiude la connessione per non perdere messaggi in silenzio). Eventuali
+/// duplicati (`dup = true`) vengono comunque consegnati e confermati (semantica "almeno una volta",
+/// MQTT-4.3.2). Se il ricevitore `incoming` è stato chiuso, il driver conferma con `PUBACK` e
+/// scarta i messaggi restando connesso.
 pub async fn connect(
     options: MqttOptions,
 ) -> Result<(AsyncClient, mpsc::Receiver<Packet>), ClientError> {
@@ -304,6 +312,7 @@ async fn connect_with_timeout(
 
     tokio::spawn(async move {
         let mut pending = PendingTables::default();
+        let mut qos1_backlog: VecDeque<(u16, Packet)> = VecDeque::new();
 
         loop {
             tokio::select! {
@@ -317,6 +326,33 @@ async fn connect_with_timeout(
                 } => {
                     if framed.send(Packet::PingReq).await.is_err() {
                         break;
+                    }
+                }
+
+                permit = incoming_tx.reserve(), if !qos1_backlog.is_empty() => {
+                    match permit {
+                        Ok(permit) => {
+                            if let Some((packet_id, packet)) = qos1_backlog.pop_front() {
+                                permit.send(packet);
+                                if framed.send(Packet::PubAck { packet_id }).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Il ricevitore utente è stato chiuso: confermiamo con PUBACK
+                            // tutti i messaggi in coda e svuotiamo il backlog.
+                            let mut send_failed = false;
+                            while let Some((packet_id, _)) = qos1_backlog.pop_front() {
+                                if framed.send(Packet::PubAck { packet_id }).await.is_err() {
+                                    send_failed = true;
+                                    break;
+                                }
+                            }
+                            if send_failed {
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -441,8 +477,64 @@ async fn connect_with_timeout(
                         Some(Ok(Packet::PingResp)) => {
                             // PINGRESP è un dettaglio interno del keep-alive: consumato dal driver.
                         }
+                        Some(Ok(
+                            packet @ Packet::Publish {
+                                qos: QoS::AtLeastOnce,
+                                packet_id: Some(packet_id),
+                                ..
+                            },
+                        )) => {
+                            // I duplicati (dup = true) vengono consegnati e confermati comunque:
+                            // QoS 1 garantisce consegna "almeno una volta" (MQTT-4.3.2).
+                            if qos1_backlog.is_empty() {
+                                match incoming_tx.try_send(packet) {
+                                    Ok(()) => {
+                                        if framed.send(Packet::PubAck { packet_id }).await.is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(mpsc::error::TrySendError::Full(pkt)) => {
+                                        qos1_backlog.push_back((packet_id, pkt));
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        if framed.send(Packet::PubAck { packet_id }).await.is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else if incoming_tx.is_closed() {
+                                let mut send_failed = false;
+                                while let Some((queued_id, _)) = qos1_backlog.pop_front() {
+                                    if framed
+                                        .send(Packet::PubAck {
+                                            packet_id: queued_id,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        send_failed = true;
+                                        break;
+                                    }
+                                }
+                                if send_failed
+                                    || framed.send(Packet::PubAck { packet_id }).await.is_err()
+                                {
+                                    break;
+                                }
+                            } else if qos1_backlog.len() >= MAX_QOS1_BACKLOG {
+                                warn!(
+                                    "Incoming QoS 1 backlog exceeded {} messages, closing connection to avoid silent loss",
+                                    MAX_QOS1_BACKLOG
+                                );
+                                break;
+                            } else {
+                                // Mantiene l'ordine FIFO di consegna e di PUBACK (MQTT-4.6.0-2).
+                                qos1_backlog.push_back((packet_id, packet));
+                            }
+                        }
                         Some(Ok(packet)) => {
-                            // TODO(Fase 2, #15): con QoS 1 in ingresso non si può scartare prima del PUBACK.
                             match incoming_tx.try_send(packet) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {

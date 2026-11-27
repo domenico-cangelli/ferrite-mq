@@ -59,7 +59,7 @@ ferrite-protocol → ferrite-broker-core → ferrite-broker → ferrite-client �
 - [x] Registrazione sottoscrizioni via `subscribe(filter, qos)` con attesa del `SUBACK` e restituzione del `QoS` concesso (`ClientError::SubscriptionRefused` su `0x80`).
 - [x] Disconnessione pulita via `disconnect()`.
 - [x] Heartbeat periodico automatico con `tokio::time::interval` impostato sul 75% del keep-alive negoziato (con soglia minima per prevenire panic).
-- [ ] Risposta automatica `PUBACK` ai `PUBLISH` QoS 1 ricevuti: Fase 2.
+- [x] Risposta automatica `PUBACK` ai `PUBLISH` QoS 1 ricevuti (con backlog FIFO limitato e back-pressure sul protocollo).
 - [ ] Impostare il Will tramite `MqttOptions`: Fase 4.
 
 ### Workspace
