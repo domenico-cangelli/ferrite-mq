@@ -1,15 +1,15 @@
 use ferrite_broker_core::run_server;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:1883";
 
-/// Versione provvisoria per TDD: ignora ancora il valore fornito.
-fn parse_bind_addr(_raw: Option<String>) -> Result<SocketAddr, String> {
-    DEFAULT_BIND_ADDR
-        .parse()
-        .map_err(|e| format!("invalid default bind address: {e}"))
+fn parse_bind_addr(raw: Option<String>) -> Result<SocketAddr, String> {
+    let value = raw.unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
+    value
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("Invalid FERRITE_BIND_ADDR {value:?}: {e}"))
 }
 
 #[tokio::main]
@@ -22,6 +22,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     let bind_addr = parse_bind_addr(std::env::var("FERRITE_BIND_ADDR").ok())?;
+    if !bind_addr.ip().is_loopback() {
+        warn!(
+            "Binding on non-loopback address {}: broker accepts network connections without authentication yet (planned for Phase 6)",
+            bind_addr
+        );
+    }
+
     let listener = TcpListener::bind(bind_addr).await?;
     info!("🚀 FerriteMQ broker running on {}", bind_addr);
 
