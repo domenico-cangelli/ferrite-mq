@@ -161,12 +161,12 @@ async fn unsubscribe_if_owner(
 }
 
 /// Raccoglie i destinatari (`client_id`, `ClientSender`) per un `PUBLISH` su `topic`.
+/// Mantiene il read lock sul trie mentre legge `sessions` (ordine `trie` -> `sessions`)
+/// per evitare race con `register_session` durante un takeover; rilascia entrambi i lock
+/// prima di ritornare, senza mai fare invii sotto lock.
 async fn collect_targets(state: &BrokerState, topic: &str) -> Vec<(String, ClientSender)> {
-    let matched = {
-        let trie = state.trie.read().await;
-        trie.match_topic(topic)
-    };
-
+    let trie = state.trie.read().await;
+    let matched = trie.match_topic(topic);
     if matched.is_empty() {
         return Vec::new();
     }
