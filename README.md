@@ -59,6 +59,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Configuration
+
+### Standalone broker (`ferrite-broker`)
+
+Set `FERRITE_BIND_ADDR` to choose the listening address (default: `0.0.0.0:1883`):
+
+```sh
+FERRITE_BIND_ADDR=127.0.0.1:1883 cargo run -p ferrite-broker
+```
+
+> **Security warning:** binding to a non-loopback address such as `0.0.0.0:1883` exposes the broker to the network without authentication or ACLs yet (planned for Phase 6). Prefer `127.0.0.1:1883` for local development.
+
+### Embedded broker (`ferrite-broker-core`)
+
+Use `run_server_with_config` and `BrokerConfig` to override the defaults (`max_packet_size = 2 MiB`, `connect_timeout = 10 s`):
+
+```rust
+use ferrite_broker_core::{run_server_with_config, BrokerConfig};
+use std::time::Duration;
+use tokio::net::TcpListener;
+
+let listener = TcpListener::bind("127.0.0.1:1883").await?;
+let config = BrokerConfig {
+    max_packet_size: 4 * 1024 * 1024,
+    connect_timeout: Duration::from_secs(5),
+};
+run_server_with_config(listener, config).await?;
+```
+
+Note: `ferrite-client` currently decodes packets up to 2 MiB (`MqttCodec::default()`).
+
 ## Development
 
 ```sh
