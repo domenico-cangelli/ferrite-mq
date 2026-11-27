@@ -63,6 +63,27 @@ fn next_id(counter: &AtomicU16) -> u16 {
         .expect("la closure restituisce sempre Some")
 }
 
+/// Sceglie un Packet ID libero nell'intervallo [1, 65535] che non risulti occupato da `is_busy`.
+///
+/// Se `preferred` è valido (!= 0) e libero, lo restituisce subito. Altrimenti avanza `counter`
+/// con `next_id` (che salta sempre lo 0) al massimo 65535 volte. Ritorna `None` se tutti gli
+/// ID sono attualmente in volo (MQTT-2.3.1-2).
+fn free_packet_id<F>(counter: &AtomicU16, preferred: u16, is_busy: F) -> Option<u16>
+where
+    F: Fn(u16) -> bool,
+{
+    if preferred != 0 && !is_busy(preferred) {
+        return Some(preferred);
+    }
+    for _ in 0..u16::MAX {
+        let candidate = next_id(counter);
+        if !is_busy(candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 impl AsyncClient {
     pub fn next_packet_id(&self) -> u16 {
         next_id(&self.packet_id_counter)
@@ -174,39 +195,63 @@ impl MqttOptions {
     }
 }
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connette il client al broker MQTT e avvia il driver di rete in background.
+///
+/// Restituisce l'handle [`AsyncClient`] per inviare comandi e il ricevitore `mpsc::Receiver<Packet>`
+/// per i pacchetti in ingresso. Quando tutti gli handle `AsyncClient` (inclusi eventuali clone)
+/// vengono distrutti, il driver invia `DISCONNECT` al broker e termina, chiudendo anche il canale
+/// `incoming` (anche se il ricevitore è ancora tenuto vivo dal chiamante).
 pub async fn connect(
     options: MqttOptions,
 ) -> Result<(AsyncClient, mpsc::Receiver<Packet>), ClientError> {
-    let stream = TcpStream::connect(options.broker_addr).await?;
-    let mut framed = Framed::new(stream, MqttCodec::default());
+    connect_with_timeout(options, CONNECT_TIMEOUT).await
+}
 
+async fn connect_with_timeout(
+    options: MqttOptions,
+    connect_timeout: Duration,
+) -> Result<(AsyncClient, mpsc::Receiver<Packet>), ClientError> {
+    let broker_addr = options.broker_addr;
+    let keep_alive = options.keep_alive;
     let connect_packet = Packet::Connect {
         protocol_version: ProtocolVersion::Mqtt311,
         clean_session: options.clean_session,
-        keep_alive: options.keep_alive,
+        keep_alive,
         client_id: options.client_id,
         will: None,
         username: None,
         password: None,
     };
-    framed.send(connect_packet).await?;
 
-    match framed.next().await {
-        Some(Ok(Packet::ConnAck {
-            return_code: ConnectReturnCode::Accepted,
-            ..
-        })) => {}
-        Some(Ok(Packet::ConnAck { return_code, .. })) => {
-            return Err(ClientError::ConnectionRefused(return_code));
-        }
-        Some(Ok(_unexpected)) => {
-            return Err(ClientError::Protocol(
+    let mut framed = tokio::time::timeout(connect_timeout, async {
+        let stream = TcpStream::connect(broker_addr).await?;
+        let mut framed = Framed::new(stream, MqttCodec::default());
+        framed.send(connect_packet).await?;
+
+        match framed.next().await {
+            Some(Ok(Packet::ConnAck {
+                return_code: ConnectReturnCode::Accepted,
+                ..
+            })) => Ok(framed),
+            Some(Ok(Packet::ConnAck { return_code, .. })) => {
+                Err(ClientError::ConnectionRefused(return_code))
+            }
+            Some(Ok(_unexpected)) => Err(ClientError::Protocol(
                 ferrite_protocol::ProtocolError::InvalidPacketType(0),
-            ));
+            )),
+            Some(Err(e)) => Err(ClientError::Protocol(e)),
+            None => Err(ClientError::ConnectionClosed),
         }
-        Some(Err(e)) => return Err(ClientError::Protocol(e)),
-        None => return Err(ClientError::ConnectionClosed),
-    }
+    })
+    .await
+    .map_err(|_| {
+        ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "connect timeout",
+        ))
+    })??;
 
     let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(100);
     let (incoming_tx, incoming_rx) = mpsc::channel::<Packet>(100);
@@ -214,15 +259,14 @@ pub async fn connect(
     let packet_id_counter = Arc::new(AtomicU16::new(1));
     let id_gen = packet_id_counter.clone();
 
-    let ping_duration = if options.keep_alive > 0 {
-        let millis = (options.keep_alive as u64 * 1000 * 3) / 4;
-        Duration::from_millis(millis).max(Duration::from_millis(250))
+    let mut ping_interval = if keep_alive > 0 {
+        let millis = (keep_alive as u64 * 1000 * 3) / 4;
+        let mut iv = interval(Duration::from_millis(millis).max(Duration::from_millis(250)));
+        iv.tick().await;
+        Some(iv)
     } else {
-        Duration::from_secs(u64::MAX / 2)
+        None
     };
-
-    let mut ping_interval = interval(ping_duration);
-    ping_interval.tick().await;
 
     tokio::spawn(async move {
         // Mappa dei pacchetti QoS 1 in volo in attesa di PUBACK
@@ -232,15 +276,22 @@ pub async fn connect(
 
         loop {
             tokio::select! {
-                _ = ping_interval.tick(), if options.keep_alive > 0 => {
+                _ = async {
+                    match ping_interval.as_mut() {
+                        Some(iv) => {
+                            iv.tick().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
                     if framed.send(Packet::PingReq).await.is_err() {
                         break;
                     }
                 }
 
-                Some(cmd) = command_rx.recv() => {
+                cmd = command_rx.recv() => {
                     match cmd {
-                        ClientCommand::PublishQoS0 { topic, payload } => {
+                        Some(ClientCommand::PublishQoS0 { topic, payload }) => {
                             let packet = Packet::Publish {
                                 topic,
                                 qos: QoS::AtMostOnce,
@@ -253,7 +304,16 @@ pub async fn connect(
                                 break;
                             }
                         }
-                        ClientCommand::PublishQoS1 { packet_id, topic, payload, ack_sender } => {
+                        Some(ClientCommand::PublishQoS1 { packet_id, topic, payload, ack_sender }) => {
+                            pending_acks.retain(|_, tx| !tx.is_closed());
+                            pending_unsubacks.retain(|_, tx| !tx.is_closed());
+                            let Some(packet_id) = free_packet_id(&id_gen, packet_id, |id| {
+                                pending_acks.contains_key(&id)
+                                    || pending_unsubacks.contains_key(&id)
+                            }) else {
+                                warn!("Dropping PublishQoS1: all 65535 MQTT packet IDs are in flight");
+                                continue;
+                            };
                             pending_acks.insert(packet_id, ack_sender);
                             let packet = Packet::Publish {
                                 topic,
@@ -267,8 +327,17 @@ pub async fn connect(
                                 break;
                             }
                         }
-                        ClientCommand::Subscribe { filter, qos } => {
-                            let packet_id = next_id(&id_gen);
+                        Some(ClientCommand::Subscribe { filter, qos }) => {
+                            pending_acks.retain(|_, tx| !tx.is_closed());
+                            pending_unsubacks.retain(|_, tx| !tx.is_closed());
+                            let preferred = next_id(&id_gen);
+                            let Some(packet_id) = free_packet_id(&id_gen, preferred, |id| {
+                                pending_acks.contains_key(&id)
+                                    || pending_unsubacks.contains_key(&id)
+                            }) else {
+                                warn!("Dropping Subscribe: all 65535 MQTT packet IDs are in flight");
+                                continue;
+                            };
                             let packet = Packet::Subscribe {
                                 packet_id,
                                 topics: vec![SubscribeTopic { filter, qos }],
@@ -277,11 +346,20 @@ pub async fn connect(
                                 break;
                             }
                         }
-                        ClientCommand::Unsubscribe {
+                        Some(ClientCommand::Unsubscribe {
                             packet_id,
                             filter,
                             ack_sender,
-                        } => {
+                        }) => {
+                            pending_acks.retain(|_, tx| !tx.is_closed());
+                            pending_unsubacks.retain(|_, tx| !tx.is_closed());
+                            let Some(packet_id) = free_packet_id(&id_gen, packet_id, |id| {
+                                pending_acks.contains_key(&id)
+                                    || pending_unsubacks.contains_key(&id)
+                            }) else {
+                                warn!("Dropping Unsubscribe: all 65535 MQTT packet IDs are in flight");
+                                continue;
+                            };
                             pending_unsubacks.insert(packet_id, ack_sender);
                             let packet = Packet::Unsubscribe {
                                 packet_id,
@@ -291,31 +369,33 @@ pub async fn connect(
                                 break;
                             }
                         }
-                        ClientCommand::Disconnect => {
+                        Some(ClientCommand::Disconnect) | None => {
+                            // Tutti gli handle sono stati distrutti o è stato chiesto Disconnect:
+                            // inviamo DISCONNECT (MQTT-3.14.4-3) e terminiamo il driver.
                             let _ = framed.send(Packet::Disconnect).await;
                             break;
                         }
                     }
                 }
 
-                Some(incoming) = framed.next() => {
+                incoming = framed.next() => {
                     match incoming {
-                        Ok(Packet::PubAck { packet_id }) => {
+                        Some(Ok(Packet::PubAck { packet_id })) => {
                             // Se un oneshot::Sender è registrato per questo ID, inviamo la notifica
                             if let Some(ack_tx) = pending_acks.remove(&packet_id) {
                                 let _ = ack_tx.send(());
                             }
                         }
-                        Ok(Packet::UnsubAck { packet_id }) => {
+                        Some(Ok(Packet::UnsubAck { packet_id })) => {
                             // Risolviamo il oneshot senza inoltrare UNSUBACK al canale incoming
                             if let Some(ack_tx) = pending_unsubacks.remove(&packet_id) {
                                 let _ = ack_tx.send(());
                             }
                         }
-                        Ok(Packet::PingResp) => {
+                        Some(Ok(Packet::PingResp)) => {
                             // PINGRESP è un dettaglio interno del keep-alive: consumato dal driver.
                         }
-                        Ok(packet) => {
+                        Some(Ok(packet)) => {
                             // TODO(Fase 2, #15): con QoS 1 in ingresso non si può scartare prima del PUBACK.
                             match incoming_tx.try_send(packet) {
                                 Ok(()) => {}
@@ -329,11 +409,9 @@ pub async fn connect(
                                 }
                             }
                         }
-                        Err(_) => break,
+                        Some(Err(_)) | None => break,
                     }
                 }
-
-                else => break,
             }
         }
     });
@@ -410,5 +488,156 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), 8000);
+    }
+
+    async fn accept_and_connack(
+        listener: &tokio::net::TcpListener,
+    ) -> Framed<TcpStream, MqttCodec> {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut framed = Framed::new(stream, MqttCodec::default());
+        let first = framed.next().await.unwrap().unwrap();
+        assert!(matches!(first, Packet::Connect { .. }));
+        framed
+            .send(Packet::ConnAck {
+                session_present: false,
+                return_code: ConnectReturnCode::Accepted,
+            })
+            .await
+            .unwrap();
+        framed
+    }
+
+    #[tokio::test]
+    async fn test_dropping_all_handles_sends_disconnect_and_closes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let broker = tokio::spawn(async move {
+            let mut framed = accept_and_connack(&listener).await;
+            let pkt = tokio::time::timeout(Duration::from_secs(2), framed.next())
+                .await
+                .expect("il finto broker non ha ricevuto DISCONNECT entro 2s")
+                .expect("connessione chiusa senza DISCONNECT")
+                .expect("errore codec");
+            assert_eq!(pkt, Packet::Disconnect);
+
+            let eof = tokio::time::timeout(Duration::from_secs(2), framed.next())
+                .await
+                .expect("il socket non si è chiuso dopo DISCONNECT");
+            assert!(eof.is_none());
+        });
+
+        let mut opts = MqttOptions::new("drop-handle", addr);
+        opts.keep_alive = 60;
+        let (client, _incoming_rx) = connect(opts).await.unwrap();
+
+        // Distruggiamo l'unico handle: il driver deve inviare DISCONNECT e terminare.
+        drop(client);
+        broker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_broker_eof_wakes_pending_qos1_and_closes_incoming() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let broker = tokio::spawn(async move {
+            let mut framed = accept_and_connack(&listener).await;
+            // Legge il PUBLISH QoS 1 e chiude il socket senza rispondere PUBACK (EOF).
+            let pkt = framed.next().await.unwrap().unwrap();
+            assert!(matches!(pkt, Packet::Publish { .. }));
+            drop(framed);
+        });
+
+        let mut opts = MqttOptions::new("eof-client", addr);
+        opts.keep_alive = 60;
+        let (client, mut incoming_rx) = connect(opts).await.unwrap();
+
+        let pub_res = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.publish_qos1("t/eof", Bytes::from_static(b"hi")),
+        )
+        .await
+        .expect("publish_qos1 è rimasto appeso dopo EOF del broker");
+        assert!(pub_res.is_err());
+
+        let incoming_closed = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
+            .await
+            .expect("incoming_rx non si è chiuso dopo EOF del broker");
+        assert!(incoming_closed.is_none());
+
+        broker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_connect_timeout_when_broker_never_responds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Finto broker che accetta il TCP ma non risponde mai.
+        let _broker = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let opts = MqttOptions::new("silent-broker", addr);
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            connect_with_timeout(opts, Duration::from_millis(150)),
+        )
+        .await
+        .expect("connect_with_timeout non ha rispettato il timeout");
+
+        match res {
+            Err(ClientError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            Ok(_) => panic!("atteso errore TimedOut, ottenuto Ok"),
+            Err(other) => panic!("atteso ClientError::Io(TimedOut), ottenuto {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_keep_alive_zero_sends_no_pingreq() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let broker = tokio::spawn(async move {
+            let mut framed = accept_and_connack(&listener).await;
+            let unexpected = tokio::time::timeout(Duration::from_millis(1500), framed.next()).await;
+            assert!(
+                unexpected.is_err(),
+                "con keep_alive = 0 il client non deve inviare PINGREQ, ricevuto: {:?}",
+                unexpected
+            );
+        });
+
+        let mut opts = MqttOptions::new("no-keepalive", addr);
+        opts.keep_alive = 0;
+        let (_client, _incoming_rx) = connect(opts).await.unwrap();
+        broker.await.unwrap();
+    }
+
+    #[test]
+    fn test_free_packet_id_selection_wrap_and_exhaustion() {
+        // 1. Preferito libero -> restituito subito
+        let counter = AtomicU16::new(10);
+        assert_eq!(free_packet_id(&counter, 5, |_| false), Some(5));
+
+        // 2. Preferito occupato -> sceglie il primo libero dal contatore
+        let counter = AtomicU16::new(2);
+        assert_eq!(
+            free_packet_id(&counter, 1, |id| id == 1 || id == 2),
+            Some(3)
+        );
+
+        // 3. Wrap oltre 65535 -> salta sempre 0 e riparte da 1
+        let counter = AtomicU16::new(u16::MAX);
+        assert_eq!(
+            free_packet_id(&counter, u16::MAX, |id| id == u16::MAX),
+            Some(1)
+        );
+
+        // 4. Tutti i 65535 ID occupati -> None
+        let counter = AtomicU16::new(1);
+        assert_eq!(free_packet_id(&counter, 1, |_| true), None);
     }
 }
