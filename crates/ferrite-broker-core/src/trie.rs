@@ -583,4 +583,27 @@ mod tests {
         assert_eq!(validate_topic_name("a/#"), Err(TopicNameError::Wildcard));
         assert_eq!(validate_topic_name("a/\0/b"), Err(TopicNameError::NulChar));
     }
+
+    #[test]
+    fn test_unsubscribe_invalid_filter_does_not_remove_valid_subscription() {
+        let mut trie = TopicTrie::new();
+        trie.subscribe("a/#", "c1".into(), QoS::AtMostOnce);
+        trie.unsubscribe("a/#/b", "c1");
+        assert_eq!(
+            trie.match_topic("a/x").len(),
+            1,
+            "unsubscribe con filtro invalido 'a/#/b' non deve rimuovere 'a/#'"
+        );
+
+        trie.subscribe("#", "c2".into(), QoS::AtMostOnce);
+        trie.unsubscribe("#/x", "c2");
+        let matched_c2 = trie
+            .match_topic("any/topic")
+            .into_iter()
+            .any(|s| s.client_id == "c2");
+        assert!(
+            matched_c2,
+            "unsubscribe con filtro invalido '#/x' non deve rimuovere '#'"
+        );
+    }
 }

@@ -160,6 +160,28 @@ async fn unsubscribe_if_owner(
     Some(())
 }
 
+/// Raccoglie i destinatari (`client_id`, `ClientSender`) per un `PUBLISH` su `topic`.
+async fn collect_targets(state: &BrokerState, topic: &str) -> Vec<(String, ClientSender)> {
+    let matched = {
+        let trie = state.trie.read().await;
+        trie.match_topic(topic)
+    };
+
+    if matched.is_empty() {
+        return Vec::new();
+    }
+
+    let sessions = state.sessions.read().await;
+    matched
+        .into_iter()
+        .filter_map(|sub| {
+            sessions
+                .get(&sub.client_id)
+                .map(|session| (sub.client_id, session.tx.clone()))
+        })
+        .collect()
+}
+
 /// Sessione attiva di un client: canale verso la sua connessione + identificativo
 /// univoco della *connessione* (non del client_id, che può essere riusato).
 pub struct SessionHandle {
@@ -565,52 +587,31 @@ async fn session_loop(
                             }
                         }
 
-                        // 2. Lookup nel TopicTrie per trovare chi è iscritto
-                        let matched = {
-                            let trie = state.trie.read().await;
-                            trie.match_topic(&topic)
-                        };
-
-                        // 3. Instradamento ai subscriber trovati
-                        if !matched.is_empty() {
-                            // Il read lock su `sessions` vive solo dentro questo blocco:
-                            // cloniamo i sender e rilasciamo il lock prima di inviare.
-                            let targets: Vec<(String, ClientSender)> = {
-                                let sessions = state.sessions.read().await;
-                                matched
-                                    .into_iter()
-                                    .filter_map(|sub| {
-                                        sessions
-                                            .get(&sub.client_id)
-                                            .map(|session| (sub.client_id, session.tx.clone()))
-                                    })
-                                    .collect()
+                        // 2. Raccolta destinatari e instradamento (nessun invio sotto lock)
+                        let targets = collect_targets(state, &topic).await;
+                        for (target_client_id, tx) in targets {
+                            let outgoing = Packet::Publish {
+                                topic: topic.clone(),
+                                // Il QoS 1 in uscita non è ancora supportato (servirebbe un
+                                // packet_id dedicato): consegniamo a QoS 0.
+                                qos: QoS::AtMostOnce,
+                                // MQTT-3.3.1-9: RETAIN=0 per sottoscrizioni già esistenti
+                                // (i retained verranno consegnati al SUBSCRIBE in Fase 4).
+                                retain: false,
+                                // MQTT-3.3.1-2: DUP vale sulla singola tratta ed è sempre 0 a QoS 0.
+                                dup: false,
+                                packet_id: None,
+                                payload: payload.clone(),
                             };
-
-                            for (target_client_id, tx) in targets {
-                                let outgoing = Packet::Publish {
-                                    topic: topic.clone(),
-                                    // Il QoS 1 in uscita non è ancora supportato (servirebbe un
-                                    // packet_id dedicato): consegniamo a QoS 0.
-                                    qos: QoS::AtMostOnce,
-                                    // MQTT-3.3.1-9: RETAIN=0 per sottoscrizioni già esistenti
-                                    // (i retained verranno consegnati al SUBSCRIBE in Fase 4).
-                                    retain: false,
-                                    // MQTT-3.3.1-2: DUP vale sulla singola tratta ed è sempre 0 a QoS 0.
-                                    dup: false,
-                                    packet_id: None,
-                                    payload: payload.clone(),
-                                };
-                                match tx.try_send(outgoing) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        warn!(
-                                            "Dropping QoS 0 message for slow client [{}]: outbound queue full",
-                                            target_client_id
-                                        );
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                            match tx.try_send(outgoing) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    warn!(
+                                        "Dropping QoS 0 message for slow client [{}]: outbound queue full",
+                                        target_client_id
+                                    );
                                 }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {}
                             }
                         }
                     }
@@ -916,5 +917,111 @@ mod tests {
             codec.decode(&mut over),
             Err(ProtocolError::PacketTooLarge)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_unsubscribe_with_invalid_filter_closes_connection_without_unsuback() {
+        use ferrite_protocol::ProtocolVersion;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = BrokerState::default();
+
+        let server_task = tokio::spawn(async move {
+            let (socket, peer_addr) = listener.accept().await.unwrap();
+            let _ = handle_client(socket, peer_addr, state, BrokerConfig::default()).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, MqttCodec::default());
+
+        framed
+            .send(Packet::Connect {
+                protocol_version: ProtocolVersion::Mqtt311,
+                clean_session: true,
+                keep_alive: 60,
+                client_id: "unsub-invalid-client".into(),
+                will: None,
+                username: None,
+                password: None,
+            })
+            .await
+            .unwrap();
+        let connack = timeout(Duration::from_secs(1), framed.next())
+            .await
+            .expect("timeout su CONNACK")
+            .expect("EOF su CONNACK")
+            .expect("errore codec su CONNACK");
+        assert!(matches!(
+            connack,
+            Packet::ConnAck {
+                return_code: ConnectReturnCode::Accepted,
+                ..
+            }
+        ));
+
+        framed
+            .send(Packet::Subscribe {
+                packet_id: 1,
+                topics: vec![SubscribeTopic {
+                    filter: "a/#".into(),
+                    qos: QoS::AtMostOnce,
+                }],
+            })
+            .await
+            .unwrap();
+        let suback = timeout(Duration::from_secs(1), framed.next())
+            .await
+            .expect("timeout su SUBACK")
+            .expect("EOF su SUBACK")
+            .expect("errore codec su SUBACK");
+        assert!(matches!(suback, Packet::SubAck { packet_id: 1, .. }));
+
+        framed
+            .send(Packet::Unsubscribe {
+                packet_id: 2,
+                filters: vec!["valid/topic".into(), "a/#/b".into()],
+            })
+            .await
+            .unwrap();
+
+        let res = timeout(Duration::from_secs(1), framed.next())
+            .await
+            .expect("il broker non ha chiuso la connessione dopo UNSUBSCRIBE invalido");
+        assert!(
+            res.is_none(),
+            "attesa chiusura connessione senza UNSUBACK, ricevuto: {:?}",
+            res
+        );
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_collect_targets_holds_trie_read_lock_while_acquiring_sessions() {
+        let state = BrokerState::default();
+        let (session, _rx) = handle(1);
+        state.register_session("c", session).await;
+        state
+            .trie
+            .write()
+            .await
+            .subscribe("t", "c".into(), QoS::AtMostOnce);
+
+        let sessions_guard = state.sessions.write().await;
+
+        let state_clone = state.clone();
+        let task = tokio::spawn(async move { collect_targets(&state_clone, "t").await });
+        tokio::task::yield_now().await;
+
+        assert!(
+            state.trie.try_write().is_err(),
+            "collect_targets deve mantenere il read lock sul trie mentre attende il lock su sessions"
+        );
+
+        drop(sessions_guard);
+        let targets = task.await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "c");
     }
 }
