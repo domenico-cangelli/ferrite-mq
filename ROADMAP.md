@@ -143,7 +143,7 @@ Attualmente il broker recapita i messaggi ai subscriber con `packet_id: None` (c
   - Gestire il `PUBACK` proveniente dal subscriber e rimuovere il messaggio dalla tabella dei messaggi in volo (oggi il `PUBACK` viene ignorato).
   - Al massimo `max_inflight_messages` (20) messaggi in attesa di conferma; gli altri aspettano in coda in memoria.
   - A coda piena: scartare il messaggio nuovo, avvisare nel log e contare gli scarti. Il client resta collegato.
-  - Da decidere: limiti della coda per client (predefiniti di Mosquitto oppure limite di 64 MiB).
+  - Limiti per client come Mosquitto: `max_inflight_messages` 20, `max_queued_messages` 1000, `max_queued_bytes` 0 (nessun limite).
   - La rispedizione alla riconnessione appartiene alla Fase 3.
 - **Client** — completato (PR #46):
   - `PUBACK` inviato solo dopo la consegna al programma, con coda interna limitata.
@@ -202,6 +202,9 @@ Attualmente il broker recapita i messaggi ai subscriber con `packet_id: None` (c
 | ~~`encode_string` tronca con `as u16` le stringhe più lunghe di 65535 byte invece di restituire un errore.~~ | `protocol/codec.rs` | Risolto (issue #10: `encode_str`/`encode_bytes` con `StringTooLong` e scrittura atomica) |
 | Il `Will` ricevuto nel `CONNECT` è decodificato ma il broker lo ignora. | `broker-core/server.rs` | Fase 4 |
 | ~~Il broker non gestisce `UNSUBSCRIBE`: il trie ha `unsubscribe`, ma non è raggiungibile dalla rete.~~ | `protocol`, `broker-core` | Risolto (issue #9: `UNSUBSCRIBE`/`UNSUBACK` end-to-end in protocollo, broker e client) |
+| ~~`UNSUBSCRIBE` con filtro invalido (es. `a/#/b`) rimuoveva una sottoscrizione valida (`a/#`) e rispondeva `UNSUBACK`.~~ | `broker-core/trie.rs`, `broker-core/server.rs` | Risolto (issue #50: validazione filtri con `validate_filter` in `TopicTrie::unsubscribe` e disconnessione in `session_loop`) |
+| ~~Race tra routing di un `PUBLISH` e takeover di sessione: il read lock sul trie veniva rilasciato prima di leggere `sessions`.~~ | `broker-core/server.rs` | Risolto (issue #51: `collect_targets` mantiene il read lock sul trie durante la lettura di `sessions`) |
+| Broker e client non leggono mentre scrivono sul socket (`send(..).await` dentro `select!`): possibili blocchi reciproci su scritture grandi e ritardi su keep-alive/PUBACK. | `broker-core/server.rs`, `client/client.rs` | Aperto (issue #52) |
 
 
 ---
