@@ -17,6 +17,9 @@ use tracing::{error, info, warn};
 type ClientSender = mpsc::Sender<Packet>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Dimensione massima predefinita di un pacchetto MQTT dopo il `CONNECT` (2 MiB).
+const DEFAULT_MAX_PACKET_SIZE: usize = 2 * 1024 * 1024;
+
 /// Pausa dopo un errore di `TcpListener::accept()` (es. EMFILE) per evitare busy-loop al 100% di CPU.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -25,6 +28,25 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Dimensione massima accettata per il pacchetto `CONNECT` iniziale (prima dell'autenticazione).
 const PRE_CONNECT_MAX_PACKET_SIZE: usize = 64 * 1024;
+
+/// Configurazione del broker MQTT passata a [`run_server_with_config`].
+#[derive(Debug, Clone)]
+pub struct BrokerConfig {
+    /// Dimensione massima accettata per un singolo pacchetto MQTT dopo il `CONNECT` (default: 2 MiB).
+    /// Prima del `CONNECT` vale comunque il minore tra questo valore e 64 KiB.
+    pub max_packet_size: usize,
+    /// Tempo massimo concesso a una nuova connessione TCP per inviare il pacchetto `CONNECT` (default: 10 s).
+    pub connect_timeout: Duration,
+}
+
+impl Default for BrokerConfig {
+    fn default() -> Self {
+        Self {
+            max_packet_size: DEFAULT_MAX_PACKET_SIZE,
+            connect_timeout: CONNECT_TIMEOUT,
+        }
+    }
+}
 
 /// Tempo massimo concesso per scrivere un pacchetto sul socket di un client.
 /// Se il client non legge e il buffer TCP resta pieno oltre questa soglia,
@@ -206,6 +228,15 @@ impl BrokerState {
             sessions.remove(client_id);
         }
     }
+}
+
+/// Avvia il broker con la configurazione specificata.
+/// (Versione provvisoria per TDD: ignora ancora `config` e delega a `run_server`.)
+pub async fn run_server_with_config(
+    listener: TcpListener,
+    _config: BrokerConfig,
+) -> Result<(), BoxError> {
+    run_server(listener).await
 }
 
 pub async fn run_server(listener: TcpListener) -> Result<(), BoxError> {

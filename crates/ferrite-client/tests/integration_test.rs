@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use ferrite_broker_core::run_server;
+use ferrite_broker_core::{run_server, run_server_with_config, BrokerConfig};
 use ferrite_client::{connect, MqttOptions, Packet, QoS};
 use ferrite_protocol::{MqttCodec, ProtocolVersion};
 use futures::{SinkExt, StreamExt};
@@ -1417,4 +1417,188 @@ async fn test_client_subscribe_refused_and_valid_immediate_delivery() {
 
     pub_client.disconnect().await.unwrap();
     sub_client.disconnect().await.unwrap();
+}
+
+async fn start_test_broker_with_config(config: BrokerConfig) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let _ = run_server_with_config(listener, config).await;
+    });
+
+    addr
+}
+
+#[tokio::test]
+async fn test_broker_config_max_packet_size_1024_closes_on_2kib_publish() {
+    let broker_addr = start_test_broker_with_config(BrokerConfig {
+        max_packet_size: 1024,
+        ..Default::default()
+    })
+    .await;
+
+    let mut client = raw_connect(broker_addr, "pub-too-big", 60).await;
+    client
+        .send(Packet::Publish {
+            topic: "t/big".into(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from(vec![b'x'; 2048]),
+        })
+        .await
+        .unwrap();
+
+    let closed = timeout(Duration::from_secs(2), client.next())
+        .await
+        .expect("il broker non ha chiuso la connessione dopo PUBLISH da 2 KiB con limite 1024");
+    assert!(closed.is_none());
+}
+
+#[tokio::test]
+async fn test_broker_config_max_packet_size_5mib_delivers_3mib_publish() {
+    const FIVE_MIB: usize = 5 * 1024 * 1024;
+    const THREE_MIB: usize = 3 * 1024 * 1024;
+
+    let broker_addr = start_test_broker_with_config(BrokerConfig {
+        max_packet_size: FIVE_MIB,
+        ..Default::default()
+    })
+    .await;
+
+    // Subscriber raw con codec da 5 MiB
+    let sub_stream = tokio::net::TcpStream::connect(broker_addr).await.unwrap();
+    let mut sub = Framed::new(sub_stream, MqttCodec::new(FIVE_MIB));
+    sub.send(Packet::Connect {
+        protocol_version: ProtocolVersion::Mqtt311,
+        clean_session: true,
+        keep_alive: 60,
+        client_id: "sub-5mib".into(),
+        will: None,
+        username: None,
+        password: None,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), sub.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Packet::ConnAck { .. }
+    ));
+    sub.send(Packet::Subscribe {
+        packet_id: 1,
+        topics: vec![ferrite_protocol::SubscribeTopic {
+            filter: "big/3mib".into(),
+            qos: QoS::AtMostOnce,
+        }],
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), sub.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Packet::SubAck { .. }
+    ));
+
+    // Publisher raw con codec da 5 MiB invia un PUBLISH da 3 MiB
+    let pub_stream = tokio::net::TcpStream::connect(broker_addr).await.unwrap();
+    let mut pub_raw = Framed::new(pub_stream, MqttCodec::new(FIVE_MIB));
+    pub_raw
+        .send(Packet::Connect {
+            protocol_version: ProtocolVersion::Mqtt311,
+            clean_session: true,
+            keep_alive: 60,
+            client_id: "pub-5mib".into(),
+            will: None,
+            username: None,
+            password: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), pub_raw.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Packet::ConnAck { .. }
+    ));
+
+    let payload = Bytes::from(vec![0xABu8; THREE_MIB]);
+    pub_raw
+        .send(Packet::Publish {
+            topic: "big/3mib".into(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            dup: false,
+            packet_id: None,
+            payload: payload.clone(),
+        })
+        .await
+        .unwrap();
+
+    let received = timeout(Duration::from_secs(5), sub.next())
+        .await
+        .expect("Timeout in attesa del PUBLISH da 3 MiB")
+        .expect("Connessione chiusa prima di ricevere 3 MiB")
+        .expect("Errore di protocollo sul PUBLISH da 3 MiB");
+    match received {
+        Packet::Publish {
+            topic,
+            payload: got,
+            ..
+        } => {
+            assert_eq!(topic, "big/3mib");
+            assert_eq!(got.len(), THREE_MIB);
+            assert_eq!(got, payload);
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_broker_config_connect_timeout_200ms_closes_idle_socket() {
+    let broker_addr = start_test_broker_with_config(BrokerConfig {
+        connect_timeout: Duration::from_millis(200),
+        ..Default::default()
+    })
+    .await;
+
+    let stream = tokio::net::TcpStream::connect(broker_addr).await.unwrap();
+    let mut framed = Framed::new(stream, MqttCodec::default());
+
+    let closed = timeout(Duration::from_secs(2), framed.next())
+        .await
+        .expect("il broker non ha chiuso la connessione muta entro 2s con connect_timeout=200ms");
+    assert!(closed.is_none());
+}
+
+#[tokio::test]
+async fn test_broker_config_max_packet_size_1024_rejects_2000_byte_connect_header() {
+    use tokio::io::AsyncWriteExt;
+
+    let broker_addr = start_test_broker_with_config(BrokerConfig {
+        max_packet_size: 1024,
+        ..Default::default()
+    })
+    .await;
+
+    let mut stream = tokio::net::TcpStream::connect(broker_addr).await.unwrap();
+    // Fixed header di un CONNECT con remaining_length = 2000 (varint: 0xD0, 0x0F),
+    // sopra config.max_packet_size (1024), anche se sotto 64 KiB.
+    stream.write_all(&[0x10, 0xD0, 0x0F]).await.unwrap();
+
+    let mut framed = Framed::new(stream, MqttCodec::default());
+    let closed = timeout(Duration::from_secs(2), framed.next())
+        .await
+        .expect("il broker non ha chiuso subito il CONNECT da 2000 byte con max_packet_size=1024");
+    assert!(closed.is_none());
 }
