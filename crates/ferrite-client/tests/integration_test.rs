@@ -1418,3 +1418,62 @@ async fn test_large_publish_200kib_accepted_after_connect() {
     pub_client.disconnect().await.unwrap();
     sub_client.disconnect().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_client_subscribe_refused_and_valid_immediate_delivery() {
+    let broker_addr = start_test_broker().await;
+
+    let (sub_client, mut sub_rx) = connect(MqttOptions::new("sub-refuse-real", broker_addr))
+        .await
+        .unwrap();
+
+    // 1. Filtro invalido "a/#/b" -> SubscriptionRefused
+    let refused = timeout(
+        Duration::from_secs(2),
+        sub_client.subscribe("a/#/b", QoS::AtMostOnce),
+    )
+    .await
+    .expect("timeout su subscribe invalida");
+    assert!(
+        matches!(
+            refused,
+            Err(ferrite_client::ClientError::SubscriptionRefused)
+        ),
+        "atteso SubscriptionRefused per 'a/#/b', ottenuto {:?}",
+        refused
+    );
+
+    // 2. Subito dopo sulla stessa connessione, subscribe su "a/b" riesce e restituisce il QoS concesso.
+    let granted = timeout(
+        Duration::from_secs(2),
+        sub_client.subscribe("a/b", QoS::AtLeastOnce),
+    )
+    .await
+    .expect("timeout su subscribe valida")
+    .expect("subscribe valida fallita");
+    assert_eq!(granted, QoS::AtMostOnce);
+
+    // 3. Publish immediata da un altro client (senza sleep!) deve essere ricevuta.
+    let (pub_client, _pub_rx) = connect(MqttOptions::new("pub-immediate", broker_addr))
+        .await
+        .unwrap();
+    pub_client
+        .publish("a/b", Bytes::from_static(b"instant"))
+        .await
+        .unwrap();
+
+    let received = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .expect("timeout in attesa del PUBLISH immediato")
+        .expect("canale chiuso");
+    match received {
+        Packet::Publish { topic, payload, .. } => {
+            assert_eq!(topic, "a/b");
+            assert_eq!(payload, Bytes::from_static(b"instant"));
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
+
+    pub_client.disconnect().await.unwrap();
+    sub_client.disconnect().await.unwrap();
+}

@@ -132,7 +132,12 @@ impl AsyncClient {
     }
 
     /// Sottoscrive un topic filter con il livello di QoS specificato
-    pub async fn subscribe<T: Into<String>>(&self, filter: T, qos: QoS) -> Result<(), ClientError> {
+    /// (versione provvisoria per TDD: non attende ancora il SUBACK).
+    pub async fn subscribe<T: Into<String>>(
+        &self,
+        filter: T,
+        qos: QoS,
+    ) -> Result<QoS, ClientError> {
         self.command_tx
             .send(ClientCommand::Subscribe {
                 filter: filter.into(),
@@ -141,7 +146,7 @@ impl AsyncClient {
             .await
             .map_err(|_| ClientError::ChannelClosed)?;
 
-        Ok(())
+        Ok(qos)
     }
 
     /// Annulla la sottoscrizione a un topic filter e attende il relativo UNSUBACK dal broker
@@ -639,5 +644,176 @@ mod tests {
         // 4. Tutti i 65535 ID occupati -> None
         let counter = AtomicU16::new(1);
         assert_eq!(free_packet_id(&counter, 1, |_| true), None);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_waits_for_suback_and_returns_granted_qos() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (sub_received_tx, sub_received_rx) = oneshot::channel::<u16>();
+        let (release_suback_tx, release_suback_rx) = oneshot::channel::<()>();
+
+        let broker = tokio::spawn(async move {
+            let mut framed = accept_and_connack(&listener).await;
+            let pkt = framed.next().await.unwrap().unwrap();
+            let packet_id = match pkt {
+                Packet::Subscribe { packet_id, .. } => packet_id,
+                other => panic!("atteso Subscribe, ricevuto {:?}", other),
+            };
+            let _ = sub_received_tx.send(packet_id);
+            let _ = release_suback_rx.await;
+
+            // Il client ha chiesto QoS 1, il broker concede QoS 0.
+            framed
+                .send(Packet::SubAck {
+                    packet_id,
+                    return_codes: vec![ferrite_protocol::SubAckReturnCode::SuccessQoS0],
+                })
+                .await
+                .unwrap();
+            let _ = framed.next().await;
+        });
+
+        let (client, _incoming_rx) = connect(MqttOptions::new("sub-wait", addr)).await.unwrap();
+        let client_clone = client.clone();
+        let mut sub_handle =
+            tokio::spawn(async move { client_clone.subscribe("a/b", QoS::AtLeastOnce).await });
+
+        // Aspettiamo che il finto broker abbia ricevuto la SUBSCRIBE.
+        let _pid = tokio::time::timeout(Duration::from_secs(2), sub_received_rx)
+            .await
+            .expect("il broker non ha ricevuto SUBSCRIBE")
+            .unwrap();
+
+        // Finché il broker non invia SUBACK, subscribe() NON deve completarsi.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut sub_handle)
+                .await
+                .is_err(),
+            "subscribe() si è completata prima dell'arrivo del SUBACK"
+        );
+
+        // Ora il broker invia SUBACK con QoS 0: subscribe() deve completarsi con Ok(QoS::AtMostOnce).
+        let _ = release_suback_tx.send(());
+        let granted = tokio::time::timeout(Duration::from_secs(2), sub_handle)
+            .await
+            .expect("subscribe() non si è sbloccata dopo SUBACK")
+            .unwrap()
+            .expect("subscribe() fallita");
+        assert_eq!(granted, QoS::AtMostOnce);
+
+        drop(client);
+        broker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_failure_returns_subscription_refused() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let broker = tokio::spawn(async move {
+            let mut framed = accept_and_connack(&listener).await;
+            let packet_id = match framed.next().await.unwrap().unwrap() {
+                Packet::Subscribe { packet_id, .. } => packet_id,
+                other => panic!("atteso Subscribe, ricevuto {:?}", other),
+            };
+            framed
+                .send(Packet::SubAck {
+                    packet_id,
+                    return_codes: vec![ferrite_protocol::SubAckReturnCode::Failure],
+                })
+                .await
+                .unwrap();
+            let _ = framed.next().await;
+        });
+
+        let (client, _incoming_rx) = connect(MqttOptions::new("sub-refuse", addr)).await.unwrap();
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.subscribe("a/b", QoS::AtMostOnce),
+        )
+        .await
+        .expect("timeout su subscribe()");
+        assert!(
+            matches!(res, Err(ClientError::SubscriptionRefused)),
+            "atteso Err(SubscriptionRefused), ottenuto {:?}",
+            res
+        );
+
+        drop(client);
+        broker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_returns_ack_channel_dropped_on_broker_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let broker = tokio::spawn(async move {
+            let mut framed = accept_and_connack(&listener).await;
+            let _ = framed.next().await;
+            // Chiude senza rispondere SUBACK.
+            drop(framed);
+        });
+
+        let (client, _incoming_rx) = connect(MqttOptions::new("sub-eof", addr)).await.unwrap();
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.subscribe("a/b", QoS::AtMostOnce),
+        )
+        .await
+        .expect("timeout su subscribe()");
+        assert!(
+            matches!(res, Err(ClientError::AckChannelDropped)),
+            "atteso Err(AckChannelDropped), ottenuto {:?}",
+            res
+        );
+
+        drop(client);
+        broker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_does_not_forward_suback_to_incoming() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let broker = tokio::spawn(async move {
+            let mut framed = accept_and_connack(&listener).await;
+            let packet_id = match framed.next().await.unwrap().unwrap() {
+                Packet::Subscribe { packet_id, .. } => packet_id,
+                other => panic!("atteso Subscribe, ricevuto {:?}", other),
+            };
+            framed
+                .send(Packet::SubAck {
+                    packet_id,
+                    return_codes: vec![ferrite_protocol::SubAckReturnCode::SuccessQoS0],
+                })
+                .await
+                .unwrap();
+            let _ = framed.next().await;
+        });
+
+        let (client, mut incoming_rx) =
+            connect(MqttOptions::new("sub-no-fwd", addr)).await.unwrap();
+        let granted = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.subscribe("a/b", QoS::AtMostOnce),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(granted, QoS::AtMostOnce);
+
+        let unexpected = tokio::time::timeout(Duration::from_millis(200), incoming_rx.recv()).await;
+        assert!(
+            unexpected.is_err(),
+            "SUBACK non deve apparire su incoming_rx, ricevuto: {:?}",
+            unexpected
+        );
+
+        drop(client);
+        broker.await.unwrap();
     }
 }
