@@ -1353,3 +1353,68 @@ async fn test_client_does_not_forward_pingresp() {
 
     client.disconnect().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_oversized_connect_header_closes_connection_immediately() {
+    use tokio::io::AsyncWriteExt;
+
+    let broker_addr = start_test_broker().await;
+
+    let mut stream = tokio::net::TcpStream::connect(broker_addr).await.unwrap();
+    // Fixed header di un CONNECT con remaining_length = 100_000 (varint: 0xA0, 0x8D, 0x06),
+    // oltre il limite pre-CONNECT (64 KiB), senza inviare il corpo.
+    stream.write_all(&[0x10, 0xA0, 0x8D, 0x06]).await.unwrap();
+
+    let mut framed = Framed::new(stream, MqttCodec::default());
+    let closed = timeout(Duration::from_secs(2), framed.next())
+        .await
+        .expect("il broker non ha chiuso subito la connessione con header CONNECT > 64 KiB");
+    assert!(closed.is_none());
+}
+
+#[tokio::test]
+async fn test_large_publish_200kib_accepted_after_connect() {
+    let broker_addr = start_test_broker().await;
+
+    let (sub_client, mut sub_rx) = connect(MqttOptions::new("sub-200k", broker_addr))
+        .await
+        .unwrap();
+    sub_client
+        .subscribe("large/payload", QoS::AtMostOnce)
+        .await
+        .unwrap();
+    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(suback, Packet::SubAck { .. }));
+
+    let (pub_client, _pub_rx) = connect(MqttOptions::new("pub-200k", broker_addr))
+        .await
+        .unwrap();
+    let payload = Bytes::from(vec![0x5Au8; 200 * 1024]);
+    pub_client
+        .publish("large/payload", payload.clone())
+        .await
+        .unwrap();
+
+    let received = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .expect("Timeout waiting for 200 KiB PUBLISH")
+        .expect("Channel closed");
+    match received {
+        Packet::Publish {
+            topic,
+            payload: got,
+            ..
+        } => {
+            assert_eq!(topic, "large/payload");
+            assert_eq!(got.len(), 200 * 1024);
+            assert_eq!(got, payload);
+        }
+        other => panic!("Expected Publish, got {:?}", other),
+    }
+
+    pub_client.disconnect().await.unwrap();
+    sub_client.disconnect().await.unwrap();
+}

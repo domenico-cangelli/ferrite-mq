@@ -1377,4 +1377,24 @@ mod tests {
         ));
         assert_eq!(&dst[..], initial_prefix);
     }
+
+    #[test]
+    fn test_decoder_caps_eager_reserve_on_incomplete_large_frame() {
+        let mut codec = MqttCodec::default();
+        let mut buf = BytesMut::new();
+
+        // Fixed header di un PUBLISH QoS 0 che dichiara 1 MiB (1_048_576 byte) di corpo,
+        // senza inviare alcun byte del corpo.
+        buf.put_u8(0x30);
+        let mut varint = Vec::with_capacity(4);
+        encode_varint(1024 * 1024, &mut varint).unwrap();
+        buf.put_slice(&varint);
+
+        assert_eq!(codec.decode(&mut buf).unwrap(), None);
+        assert!(
+            buf.capacity() < 16 * 1024,
+            "il decoder ha prenotato troppa memoria prima di ricevere il corpo: capacity={}",
+            buf.capacity()
+        );
+    }
 }
