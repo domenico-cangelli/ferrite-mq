@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "127.0.0.1:1883".parse()?;
     let (client, mut incoming) = connect(MqttOptions::new("my-client", addr)).await?;
 
-    client.subscribe("sensors/+/temperature", QoS::AtMostOnce).await?;
+    let _granted_qos = client.subscribe("sensors/+/temperature", QoS::AtMostOnce).await?;
     client.publish_qos1("sensors/kitchen/temperature", "21.5").await?;
 
     while let Some(packet) = incoming.recv().await {
