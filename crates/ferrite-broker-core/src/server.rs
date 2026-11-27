@@ -114,6 +114,13 @@ fn apply_subscribe(
         .collect()
 }
 
+/// Verifica se `conn_id` è ancora la connessione proprietaria corrente di `client_id`.
+fn owns(sessions: &HashMap<String, SessionHandle>, client_id: &str, conn_id: u64) -> bool {
+    sessions
+        .get(client_id)
+        .is_some_and(|session| session.conn_id == conn_id)
+}
+
 /// Applica le sottoscrizioni solo se `conn_id` è ancora la proprietaria corrente di
 /// `client_id`. Prende i lock nell'ordine fisso `trie` (write) -> `sessions` (read)
 /// e li rilascia prima di ritornare, senza mai fare I/O sotto lock.
@@ -126,10 +133,7 @@ async fn subscribe_if_owner(
 ) -> Option<Vec<SubAckReturnCode>> {
     let mut trie = state.trie.write().await;
     let sessions = state.sessions.read().await;
-    let still_owner = sessions
-        .get(client_id)
-        .is_some_and(|session| session.conn_id == conn_id);
-    if !still_owner {
+    if !owns(&sessions, client_id, conn_id) {
         return None;
     }
     Some(apply_subscribe(&mut trie, client_id, topics, filters))
@@ -147,10 +151,7 @@ async fn unsubscribe_if_owner(
 ) -> Option<()> {
     let mut trie = state.trie.write().await;
     let sessions = state.sessions.read().await;
-    let still_owner = sessions
-        .get(client_id)
-        .is_some_and(|session| session.conn_id == conn_id);
-    if !still_owner {
+    if !owns(&sessions, client_id, conn_id) {
         return None;
     }
     for filter in filters_to_remove {
@@ -240,10 +241,7 @@ impl BrokerState {
     async fn release_session(&self, client_id: &str, conn_id: u64, filters: &HashSet<String>) {
         let mut trie = self.trie.write().await;
         let mut sessions = self.sessions.write().await;
-        let still_owner = sessions
-            .get(client_id)
-            .is_some_and(|session| session.conn_id == conn_id);
-        if still_owner {
+        if owns(&sessions, client_id, conn_id) {
             for filter in filters {
                 trie.unsubscribe(filter, client_id);
             }
