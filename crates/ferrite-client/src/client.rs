@@ -63,6 +63,14 @@ fn next_id(counter: &AtomicU16) -> u16 {
         .expect("la closure restituisce sempre Some")
 }
 
+/// Versione provvisoria per TDD: non controlla ancora `is_busy`.
+fn free_packet_id<F>(_counter: &AtomicU16, preferred: u16, _is_busy: F) -> Option<u16>
+where
+    F: Fn(u16) -> bool,
+{
+    Some(preferred)
+}
+
 impl AsyncClient {
     pub fn next_packet_id(&self) -> u16 {
         next_id(&self.packet_id_counter)
@@ -176,6 +184,14 @@ impl MqttOptions {
 
 pub async fn connect(
     options: MqttOptions,
+) -> Result<(AsyncClient, mpsc::Receiver<Packet>), ClientError> {
+    connect_with_timeout(options, Duration::from_secs(10)).await
+}
+
+/// Versione provvisoria per TDD: non applica ancora il timeout.
+async fn connect_with_timeout(
+    options: MqttOptions,
+    _connect_timeout: Duration,
 ) -> Result<(AsyncClient, mpsc::Receiver<Packet>), ClientError> {
     let stream = TcpStream::connect(options.broker_addr).await?;
     let mut framed = Framed::new(stream, MqttCodec::default());
@@ -410,5 +426,156 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), 8000);
+    }
+
+    async fn accept_and_connack(
+        listener: &tokio::net::TcpListener,
+    ) -> Framed<TcpStream, MqttCodec> {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut framed = Framed::new(stream, MqttCodec::default());
+        let first = framed.next().await.unwrap().unwrap();
+        assert!(matches!(first, Packet::Connect { .. }));
+        framed
+            .send(Packet::ConnAck {
+                session_present: false,
+                return_code: ConnectReturnCode::Accepted,
+            })
+            .await
+            .unwrap();
+        framed
+    }
+
+    #[tokio::test]
+    async fn test_dropping_all_handles_sends_disconnect_and_closes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let broker = tokio::spawn(async move {
+            let mut framed = accept_and_connack(&listener).await;
+            let pkt = tokio::time::timeout(Duration::from_secs(2), framed.next())
+                .await
+                .expect("il finto broker non ha ricevuto DISCONNECT entro 2s")
+                .expect("connessione chiusa senza DISCONNECT")
+                .expect("errore codec");
+            assert_eq!(pkt, Packet::Disconnect);
+
+            let eof = tokio::time::timeout(Duration::from_secs(2), framed.next())
+                .await
+                .expect("il socket non si è chiuso dopo DISCONNECT");
+            assert!(eof.is_none());
+        });
+
+        let mut opts = MqttOptions::new("drop-handle", addr);
+        opts.keep_alive = 60;
+        let (client, _incoming_rx) = connect(opts).await.unwrap();
+
+        // Distruggiamo l'unico handle: il driver deve inviare DISCONNECT e terminare.
+        drop(client);
+        broker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_broker_eof_wakes_pending_qos1_and_closes_incoming() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let broker = tokio::spawn(async move {
+            let mut framed = accept_and_connack(&listener).await;
+            // Legge il PUBLISH QoS 1 e chiude il socket senza rispondere PUBACK (EOF).
+            let pkt = framed.next().await.unwrap().unwrap();
+            assert!(matches!(pkt, Packet::Publish { .. }));
+            drop(framed);
+        });
+
+        let mut opts = MqttOptions::new("eof-client", addr);
+        opts.keep_alive = 60;
+        let (client, mut incoming_rx) = connect(opts).await.unwrap();
+
+        let pub_res = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.publish_qos1("t/eof", Bytes::from_static(b"hi")),
+        )
+        .await
+        .expect("publish_qos1 è rimasto appeso dopo EOF del broker");
+        assert!(pub_res.is_err());
+
+        let incoming_closed = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
+            .await
+            .expect("incoming_rx non si è chiuso dopo EOF del broker");
+        assert!(incoming_closed.is_none());
+
+        broker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_connect_timeout_when_broker_never_responds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Finto broker che accetta il TCP ma non risponde mai.
+        let _broker = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let opts = MqttOptions::new("silent-broker", addr);
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            connect_with_timeout(opts, Duration::from_millis(150)),
+        )
+        .await
+        .expect("connect_with_timeout non ha rispettato il timeout");
+
+        match res {
+            Err(ClientError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            Ok(_) => panic!("atteso errore TimedOut, ottenuto Ok"),
+            Err(other) => panic!("atteso ClientError::Io(TimedOut), ottenuto {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_keep_alive_zero_sends_no_pingreq() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let broker = tokio::spawn(async move {
+            let mut framed = accept_and_connack(&listener).await;
+            let unexpected = tokio::time::timeout(Duration::from_millis(1500), framed.next()).await;
+            assert!(
+                unexpected.is_err(),
+                "con keep_alive = 0 il client non deve inviare PINGREQ, ricevuto: {:?}",
+                unexpected
+            );
+        });
+
+        let mut opts = MqttOptions::new("no-keepalive", addr);
+        opts.keep_alive = 0;
+        let (_client, _incoming_rx) = connect(opts).await.unwrap();
+        broker.await.unwrap();
+    }
+
+    #[test]
+    fn test_free_packet_id_selection_wrap_and_exhaustion() {
+        // 1. Preferito libero -> restituito subito
+        let counter = AtomicU16::new(10);
+        assert_eq!(free_packet_id(&counter, 5, |_| false), Some(5));
+
+        // 2. Preferito occupato -> sceglie il primo libero dal contatore
+        let counter = AtomicU16::new(2);
+        assert_eq!(
+            free_packet_id(&counter, 1, |id| id == 1 || id == 2),
+            Some(3)
+        );
+
+        // 3. Wrap oltre 65535 -> salta sempre 0 e riparte da 1
+        let counter = AtomicU16::new(u16::MAX);
+        assert_eq!(
+            free_packet_id(&counter, u16::MAX, |id| id == u16::MAX),
+            Some(1)
+        );
+
+        // 4. Tutti i 65535 ID occupati -> None
+        let counter = AtomicU16::new(1);
+        assert_eq!(free_packet_id(&counter, 1, |_| true), None);
     }
 }
