@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, Duration};
 use tokio_util::codec::Framed;
+use tracing::warn;
 
 /// Comandi interni inviati dall'interfaccia Client al Driver di connessione
 #[derive(Debug)]
@@ -311,9 +312,21 @@ pub async fn connect(
                                 let _ = ack_tx.send(());
                             }
                         }
+                        Ok(Packet::PingResp) => {
+                            // PINGRESP è un dettaglio interno del keep-alive: consumato dal driver.
+                        }
                         Ok(packet) => {
-                            if incoming_tx.send(packet).await.is_err() {
-                                break;
+                            // TODO(Fase 2, #15): con QoS 1 in ingresso non si può scartare prima del PUBACK.
+                            match incoming_tx.try_send(packet) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    warn!(
+                                        "Dropping incoming packet: client incoming channel is full"
+                                    );
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    // Il receiver utente è stato chiuso: il driver resta attivo.
+                                }
                             }
                         }
                         Err(_) => break,

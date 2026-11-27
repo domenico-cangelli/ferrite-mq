@@ -78,19 +78,24 @@ async fn test_pub_sub_roundtrip() {
 async fn test_client_automatic_pingreq() {
     let broker_addr = start_test_broker().await;
 
-    // Impostiamo un keep_alive brevissimo (1 secondo)
+    // Impostiamo un keep_alive brevissimo (1 secondo -> watchdog broker = 1.5s)
     let mut opts = MqttOptions::new("ping-client", broker_addr);
     opts.keep_alive = 1;
 
-    let (_client, mut incoming_rx) = connect(opts).await.expect("Connection failed");
+    let (client, _incoming_rx) = connect(opts).await.expect("Connection failed");
 
-    // In 2 secondi, il client deve aver emesso almeno un PINGREQ e aver ricevuto PINGRESP dal broker
-    let packet = timeout(Duration::from_secs(2), incoming_rx.recv())
-        .await
-        .expect("Timeout waiting for PINGRESP")
-        .expect("Channel closed");
+    // Attendiamo 2.2s (> 1.5s di watchdog): senza PINGREQ automatici il broker avrebbe chiuso.
+    tokio::time::sleep(Duration::from_millis(2200)).await;
 
-    assert_eq!(packet, Packet::PingResp);
+    timeout(
+        Duration::from_secs(2),
+        client.publish_qos1("ping/alive", Bytes::from_static(b"ok")),
+    )
+    .await
+    .expect("Timeout waiting for PUBACK: automatic PINGREQ failed to keep connection alive")
+    .expect("publish_qos1 failed");
+
+    client.disconnect().await.unwrap();
 }
 
 #[tokio::test]
@@ -1245,4 +1250,106 @@ async fn test_client_unsubscribe_waits_for_unsuback_and_stops_receiving() {
 
     pub_client.disconnect().await.unwrap();
     sub_client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_client_survives_dropped_incoming_receiver() {
+    let broker_addr = start_test_broker().await;
+
+    let mut opts = MqttOptions::new("drop-rx-client", broker_addr);
+    opts.keep_alive = 1;
+    let (client, incoming_rx) = connect(opts).await.unwrap();
+
+    // Scarta subito il ricevitore: il driver deve continuare a gestire PINGREQ/PINGRESP.
+    drop(incoming_rx);
+
+    // Oltre 1.5 * keep_alive (1.5s): il broker disconnetterebbe se i ping smettessero.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    let res = timeout(
+        Duration::from_secs(2),
+        client.publish_qos1("keep/alive", Bytes::from_static(b"ok")),
+    )
+    .await
+    .expect("publish_qos1 timed out after dropping incoming_rx");
+    res.expect("publish_qos1 failed after dropping incoming_rx");
+
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_client_driver_not_blocked_by_full_incoming_channel() {
+    let broker_addr = start_test_broker().await;
+
+    let (sub_client, mut sub_rx) = connect(MqttOptions::new("slow-rx-client", broker_addr))
+        .await
+        .unwrap();
+    sub_client
+        .subscribe("flood/in", QoS::AtMostOnce)
+        .await
+        .unwrap();
+    let suback = timeout(Duration::from_secs(2), sub_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(suback, Packet::SubAck { .. }));
+
+    // Teniamo vivo `sub_rx` ma non lo leggiamo più: la sua coda da 100 si riempirà.
+    let _held_rx = sub_rx;
+
+    let (pub_client, _pub_rx) = connect(MqttOptions::new("flood-pub", broker_addr))
+        .await
+        .unwrap();
+    for i in 0..300u32 {
+        pub_client
+            .publish("flood/in", Bytes::from(format!("msg-{i}")))
+            .await
+            .unwrap();
+    }
+
+    // Diamo tempo ai 300 messaggi di arrivare al driver del subscriber.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Nonostante la coda incoming piena, il driver del subscriber deve gestire publish_qos1.
+    let res = timeout(
+        Duration::from_secs(2),
+        sub_client.publish_qos1("other/topic", Bytes::from_static(b"still-alive")),
+    )
+    .await
+    .expect("publish_qos1 timed out: driver bloccato dal canale incoming pieno");
+    res.expect("publish_qos1 failed on slow subscriber");
+
+    pub_client.disconnect().await.unwrap();
+    sub_client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_client_does_not_forward_pingresp() {
+    let broker_addr = start_test_broker().await;
+
+    let mut opts = MqttOptions::new("no-pingresp-client", broker_addr);
+    opts.keep_alive = 1;
+    let (client, mut incoming_rx) = connect(opts).await.unwrap();
+
+    // Leggiamo incoming_rx per 2.5s: il driver deve scambiare PINGREQ/PINGRESP internamente
+    // senza mai inoltrare Packet::PingResp all'utente.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+    while let Ok(Some(packet)) = tokio::time::timeout_at(deadline, incoming_rx.recv()).await {
+        assert_ne!(
+            packet,
+            Packet::PingResp,
+            "PINGRESP non deve essere inoltrato sul canale incoming"
+        );
+    }
+
+    // La connessione deve essere ancora viva dopo 2.5s (> 1.5 * keep_alive).
+    timeout(
+        Duration::from_secs(2),
+        client.publish_qos1("ping/check", Bytes::from_static(b"alive")),
+    )
+    .await
+    .expect("publish_qos1 timed out after keep-alive window")
+    .expect("publish_qos1 failed");
+
+    client.disconnect().await.unwrap();
 }
