@@ -8,7 +8,19 @@ La metodologia di progettazione segue la catena di dipendenza logica:
 ferrite-protocol → ferrite-broker-core → ferrite-broker → ferrite-client → integration tests
 ```
 
-*Ultimo aggiornamento: 2026-10-07. Stato dei test: 31 test passano (`cargo test --workspace`).*
+*Ultimo aggiornamento: 2026-11-27. Stato dei test: 104 test passano (`cargo test --workspace`).*
+
+## 0. Strategia (decisa il 2026-11-27)
+
+Prima FerriteMQ lavora come Mosquitto (broker) e Paho C (client), poi evolve. Un valore predefinito diverso non è un miglioramento. Un miglioramento si dichiara solo con una misura di partenza, un obiettivo e un risultato misurato.
+
+| Tappa | Contenuto | Finita quando |
+| :--- | :--- | :--- |
+| **1. Parità MQTT 3.1.1** | Fasi 2-6, salvataggio su disco (#45), configurazione, funzioni client equivalenti a Paho C. Lista in #49. | Ogni voce supera una prova, anche di interoperabilità con Mosquitto e Paho. |
+| **2. Parità estesa** | MQTT 5.0, WebSocket, bridge. | Come sopra. |
+| **3. Evoluzione** | Prestazioni (Fase 7, #20) e robustezza. | Risultato misurato rispetto alla misura di partenza. |
+
+Il banco di misura (#47) parte subito dopo #15. I test di robustezza (#23) accompagnano tutte le tappe.
 
 ---
 
@@ -68,8 +80,8 @@ ferrite-protocol → ferrite-broker-core → ferrite-broker → ferrite-client �
 - [x] File di licenza `LICENSE-MIT` e `LICENSE-APACHE` compilati.
 - [x] `README.md` iniziale.
 - [ ] `ferrite-cli`: ancora un placeholder.
-- [ ] CI (GitHub Actions: `cargo fmt --check`, `cargo clippy`, `cargo test`).
-- [ ] Il codice non è ancora formattato con `cargo fmt` (diff pre-esistente).
+- [x] CI (GitHub Actions: `cargo fmt --check`, `cargo clippy`, `cargo test`).
+- [x] Codice formattato con `cargo fmt`.
 
 ---
 
@@ -128,16 +140,21 @@ Attualmente il broker recapita i messaggi ai subscriber con `packet_id: None` (c
   - Calcolare il QoS effettivo di consegna come `min(QoS del publish, QoS concesso al subscriber)`.
   - Quando il QoS effettivo è 1, generare un `packet_id` per quella specifica connessione (stesso schema di `next_id`).
   - Mantenere `in_flight_messages: HashMap<u16, Message>` per ogni sessione client.
-  - Gestire il `PUBACK` proveniente dal subscriber e rimuovere il messaggio dalla tabella dei messaggi in volo (oggi cade nel ramo `Some(Ok(_)) => {}`).
-- **Client**:
-  - Nel loop di ricezione di `ferrite-client`, intercettare i `Packet::Publish` con `qos == QoS::AtLeastOnce` e rispondere automaticamente con `Packet::PubAck { packet_id }`.
-  - Gestire la collisione di un packet ID con una voce ancora presente in `pending_acks` (dopo un wrap-around a 65535).
+  - Gestire il `PUBACK` proveniente dal subscriber e rimuovere il messaggio dalla tabella dei messaggi in volo (oggi il `PUBACK` viene ignorato).
+  - Al massimo `max_inflight_messages` (20) messaggi in attesa di conferma; gli altri aspettano in coda in memoria.
+  - A coda piena: scartare il messaggio nuovo, avvisare nel log e contare gli scarti. Il client resta collegato.
+  - Da decidere: limiti della coda per client (predefiniti di Mosquitto oppure limite di 64 MiB).
+  - La rispedizione alla riconnessione appartiene alla Fase 3.
+- **Client** — completato (PR #46):
+  - `PUBACK` inviato solo dopo la consegna al programma, con coda interna limitata.
+  - Collisione dei packet ID gestita con `free_packet_id`.
 - **Test**: un subscriber QoS 1 riceve il `PUBLISH` con `packet_id` e il broker rimuove il messaggio da `in_flight_messages` solo dopo il `PUBACK`.
 
 ### Fase 3: Sessioni Persistenti (`CleanSession = false`)
 
 - **Persistenza in memoria**: tabella globale `sessions: HashMap<String, SessionState>` dove `SessionState` sopravvive alla disconnessione se `clean_session == false`. Partire dall'attuale `SessionHandle { conn_id, tx }`.
 - **Coda offline**: bufferizzare i messaggi QoS 1 destinati a subscriber disconnessi.
+- **Rispedizione**: alla riconnessione, rispedire i messaggi non confermati.
 - **Handshake `CONNECT`**: se `clean_session == false` e la sessione esiste, riassociare la nuova socket alla sessione, svuotare la coda messaggi e restituire `session_present = true` nel `CONNACK`.
 - **Takeover**: oggi `register_session` scarta le sottoscrizioni della vecchia sessione (solo clean session). Con sessioni persistenti vanno invece mantenute; spostare le sottoscrizioni nello stato per-sessione chiude anche la finestra di race descritta in "Problemi noti".
 
@@ -169,10 +186,9 @@ Attualmente il broker recapita i messaggi ai subscriber con `packet_id: None` (c
 
 ### Fase 7: Concorrenza Avanzata e Scalabilità
 
-- **Deadlock da backpressure** (vedi "Problemi noti"): non attendere `tx.send(..).await` tenendo il read lock su `sessions`; usare `try_send` con una politica di scarto o disconnessione dei consumer lenti.
+- Già risolti: deadlock da backpressure (#3) e potatura del trie (#4).
 - **Sharded Trie**: suddivisione del `TopicTrie` in partizioni indicizzate tramite hashing del root topic per minimizzare la contesa del lock `RwLock`.
 - **Tabella sessioni lock-free**: collezioni concorrenti (es. `DashMap`) al posto di `RwLock<HashMap<...>>`.
-- **Potatura del trie**: `remove_recursive` calcola già se un ramo è vuoto ma non lo elimina.
 - **Suite di benchmark**: crate `ferrite-benchmarks` con `criterion` per misurare il throughput del codec e la latenza del matching dei topic con carichi massivi.
 
 ---
@@ -182,7 +198,7 @@ Attualmente il broker recapita i messaggi ai subscriber con `packet_id: None` (c
 | Problema | Dove | Quando risolverlo |
 | :--- | :--- | :--- |
 | ~~Possibile deadlock: nel ramo `Publish` si fa `tx.send(..).await` su un canale limitato tenendo il read lock su `sessions`. Se due client si inviano messaggi e le code si riempiono, restano in attesa reciproca.~~ | `broker-core/server.rs` | Risolto (issue #3: fan-out non bloccante con `try_send` e timeout di scrittura) |
-| ~~Finestra di race stretta: se un takeover avviene mentre la vecchia connessione elabora un `SUBSCRIBE`, può reiscrivere un filtro per il `client_id` ormai appartenente alla nuova.~~ | `broker-core/server.rs` | Risolto (issue #12: `biased;` nel `select!` + controllo proprietà sotto lock in `subscribe_if_owner`) |
+| ~~Finestra di race stretta: se un takeover avviene mentre la vecchia connessione elabora un `SUBSCRIBE`, può reiscrivere un filtro per il `client_id` ormai appartenente alla nuova.~~ | `broker-core/server.rs` | Risolto (issue #12: controllo di proprietà sotto lock in `subscribe_if_owner`; issue #43: controllo `rx.is_closed()` a inizio ciclo al posto di `biased;`) |
 | ~~`encode_string` tronca con `as u16` le stringhe più lunghe di 65535 byte invece di restituire un errore.~~ | `protocol/codec.rs` | Risolto (issue #10: `encode_str`/`encode_bytes` con `StringTooLong` e scrittura atomica) |
 | Il `Will` ricevuto nel `CONNECT` è decodificato ma il broker lo ignora. | `broker-core/server.rs` | Fase 4 |
 | ~~Il broker non gestisce `UNSUBSCRIBE`: il trie ha `unsubscribe`, ma non è raggiungibile dalla rete.~~ | `protocol`, `broker-core` | Risolto (issue #9: `UNSUBSCRIBE`/`UNSUBACK` end-to-end in protocollo, broker e client) |
@@ -216,7 +232,10 @@ Ordine di esecuzione (priorità e dipendenze):
 | 13 | #13 client: PINGRESP e canale incoming | M3 Client robusto | #1 |
 | 14 | #14 client: chiusura, timeout, SUBACK | M3 | #13 |
 | 15 | #15 Fase 2: QoS 1 verso subscriber | M4 | #3, #13 |
+| 15a | #47 banco di misura contro Mosquitto | - | #15 |
+| 15b | #49 lista di parità MQTT 3.1.1 | - | - |
 | 16 | #16 Fase 3: sessioni persistenti | M5 | #12, #15 |
+| 16a | #45 code salvate su disco | - | #16 |
 | 17 | #17 Fase 4: retained e Will | M6 | #16 |
 | 18 | #18 Fase 5: QoS 2 | M7 | #15, #8 |
 | 19 | #19 Fase 6: TLS, auth, ACL | M8 | #6 |
@@ -226,6 +245,6 @@ Ordine di esecuzione (priorità e dipendenze):
 | 23 | #23 conformità e fuzzing | M10 | #10 |
 | 24 | #24 idee oltre Paho e Mosquitto | M10 | - |
 
-Idee per superare i limiti di Paho e Mosquitto: vedi #24 (broker multi-thread, client async con backpressure, MQTT 5, metriche, persistenza su disco, cluster).
+La issue #24 raccoglie altre idee. MQTT 5.0, salvataggio su disco e bridge esistono già in Mosquitto: appartengono alla parità. Le altre idee entrano nell'evoluzione solo se migliorano prestazioni o robustezza.
 
 I passi piccoli (file, risultato atteso, comando di verifica) sono nel corpo di ogni issue.
